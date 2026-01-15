@@ -9,3 +9,4 @@ accelerate
 sqlalchemy
 psycopg[binary]
 psycopg2-binary
+firebase-admin  # Firebase Cloud Messaging

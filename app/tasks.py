@@ -1,5 +1,5 @@
 from .celery_app import celery_app
-from .pipelines import generateNotif_gpt, generate_notifications_for_patients
+from .pipelines import generateNotif_gpt, generate_notifications_for_patients, send_notifications_via_firebase
 from .db import SessionLocal
 from .models import Patient
 from celery import shared_task
@@ -104,6 +104,12 @@ def periodic_task():
         # Generate notifications for matching patients
         notif = generate_notifications_for_patients(matching_patients)
         print(notif)
+
+        # Send notifications via Firebase
+        if notif:
+            firebase_result = send_notifications_via_firebase(notif)
+            print(f"Firebase sending result: {firebase_result}")
+
         # Mark all matching patients as notified
         for patient in matching_patients:
             set_notification_sent(patient["id"])
@@ -217,5 +223,115 @@ def set_notification_sent(patient_id: str):
             session.commit()
             return True
         return False
+    finally:
+        session.close()
+
+
+@shared_task
+def send_firebase_notification_task(
+    patient_id: str, title: str, body: str, data: dict = None
+):
+    """
+    Send a Firebase notification to a specific patient.
+
+    Args:
+        patient_id: UUID string of the patient
+        title: Notification title
+        body: Notification body text
+        data: Optional dictionary of custom data
+
+    Returns:
+        Dict with status and message
+    """
+    session = SessionLocal()
+    try:
+        patient = session.query(Patient).filter(Patient.id == patient_id).first()
+        if not patient:
+            return {
+                "status": "error",
+                "message": f"Patient with id {patient_id} not found",
+            }
+
+        if not patient.firebase_token:
+            return {
+                "status": "error",
+                "message": f"Patient {patient.name} has no Firebase token",
+            }
+
+        # Send notification
+        from .firebase_messaging import send_push_notification
+
+        result = send_push_notification(
+            token=patient.firebase_token, title=title, body=body, data=data or {}
+        )
+
+        return {
+            **result,
+            "patient_id": str(patient.id),
+            "patient_name": patient.name,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Failed to send notification: {str(e)}",
+        }
+    finally:
+        session.close()
+
+
+@shared_task
+def update_firebase_token_task(patient_id: str, firebase_token: str):
+    """
+    Update the Firebase token for a patient.
+
+    Args:
+        patient_id: UUID string of the patient
+        firebase_token: New Firebase token to set
+
+    Returns:
+        Dict with status and message
+    """
+    return update_firebase_token(patient_id, firebase_token)
+
+
+def update_firebase_token(patient_id: str, firebase_token: str):
+    """
+    Update the Firebase token for a patient.
+
+    Args:
+        patient_id: UUID string of the patient
+        firebase_token: New Firebase token to set
+
+    Returns:
+        Dict with status, message, and updated patient info
+    """
+    session = SessionLocal()
+    try:
+        patient = session.query(Patient).filter(Patient.id == patient_id).first()
+        if not patient:
+            return {
+                "status": "error",
+                "message": f"Patient with id {patient_id} not found",
+            }
+
+        # Update the Firebase token
+        patient.firebase_token = firebase_token
+        session.commit()
+        session.refresh(patient)
+
+        return {
+            "status": "success",
+            "message": f"Firebase token updated for patient {patient.name}",
+            "patient_id": str(patient.id),
+            "patient_name": patient.name,
+            "firebase_token": patient.firebase_token,
+        }
+    except Exception as e:
+        session.rollback()
+        return {
+            "status": "error",
+            "message": f"Failed to update Firebase token: {str(e)}",
+        }
     finally:
         session.close()

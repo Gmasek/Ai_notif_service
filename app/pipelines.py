@@ -1,6 +1,6 @@
 from haystack.components.generators import OpenAIGenerator
-
 from dotenv import load_dotenv
+import asyncio
 
 load_dotenv()
 
@@ -82,3 +82,56 @@ def generate_notifications_for_patients(patients: list):
         print(f"Generated notification for {context['name']}: {notification_text}")
 
     return notifications
+
+
+async def send_notifications_via_firebase_async(notifications: list):
+    """
+    Send generated notifications via Firebase Cloud Messaging asynchronously.
+
+    Args:
+        notifications: List of notification dicts from generate_notifications_for_patients
+
+    Returns:
+        Dict with sending results
+    """
+    from .firebase_messaging import send_batch_notifications_async
+
+    # Convert notification format to Firebase format
+    firebase_notifications = []
+    for notif in notifications:
+        if notif.get("firebase_token"):
+            firebase_notifications.append({
+                "token": notif["firebase_token"],
+                "title": "Time to Move!",
+                "body": notif["notification_text"],
+                "data": {
+                    "patient_id": notif["patient_id"],
+                    "patient_name": notif["patient_name"],
+                }
+            })
+
+    if not firebase_notifications:
+        return {
+            "status": "skipped",
+            "message": "No valid Firebase tokens found",
+            "success_count": 0,
+            "failure_count": 0,
+        }
+
+    # Send all notifications
+    result = await send_batch_notifications_async(firebase_notifications)
+    return result
+
+
+def send_notifications_via_firebase(notifications: list):
+    """
+    Synchronous wrapper for sending notifications via Firebase.
+
+    Args:
+        notifications: List of notification dicts from generate_notifications_for_patients
+
+    Returns:
+        Dict with sending results
+    """
+    # Run async function in new event loop
+    return asyncio.run(send_notifications_via_firebase_async(notifications))
