@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+celery[redis]
+torch
+haystack-ai  # minimal Haystack setup
+redis
+transformers[torch,sentencepiece]
+accelerate
+sqlalchemy
+psycopg[binary]
+psycopg2-binary
