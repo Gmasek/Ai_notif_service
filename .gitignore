@@ -10,5 +10,8 @@ wheels/
 .venv
 .env
 
+# Environment variables with secrets
+.env.local
+
 # Firebase credentials
 firebase-service-account.json

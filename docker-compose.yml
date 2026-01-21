@@ -11,6 +11,8 @@ services:
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    env_file:
+      - .env.local
     environment:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
@@ -24,6 +26,8 @@ services:
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    env_file:
+      - .env.local
     environment:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
@@ -37,6 +41,8 @@ services:
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
+    env_file:
+      - .env.local
     environment:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db

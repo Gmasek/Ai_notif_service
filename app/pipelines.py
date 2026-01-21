@@ -1,6 +1,7 @@
 from haystack.components.generators import OpenAIGenerator
 from dotenv import load_dotenv
 import asyncio
+import random
 
 load_dotenv()
 
@@ -23,31 +24,18 @@ def generateNotif_gpt():
     return response["replies"][-1]
 
 
-def generate_notifications_for_patients(patients: list):
-    """
-    Generate personalized notifications for a list of patients.
-
-    Args:
-        patients: List of patient dictionaries with their full information
-
-    Returns:
-        List of generated notifications with patient info
-    """
-    notifications = []
-
-    for patient in patients:
-        # Extract relevant patient context (excluding id, firebase_token, notif_in_24h, time_to_notif, created_at)
-        context = {
-            "name": patient.get("name"),
-            "big5": patient.get("big5"),
-            "hobbies": patient.get("hobbies"),
-            "tpb": patient.get("tpb"),
-            "group_id": patient.get("group_id"),
-            "age": patient.get("age"),
-            "gender": patient.get("gender"),
-            "job_type": patient.get("job_type"),
-        }
-
+def prompt_builder(patient: dict, personalized: bool):
+    context = {
+        "name": patient.get("name"),
+        "big5": patient.get("big5"),
+        "hobbies": patient.get("hobbies"),
+        "tpb": patient.get("tpb"),
+        "group_id": patient.get("group_id"),
+        "age": patient.get("age"),
+        "gender": patient.get("gender"),
+        "job_type": patient.get("job_type"),
+    }
+    if personalized:
         # Create personalized prompt
         prompt = f"""
         You are a notification generator for a health and wellness app.
@@ -65,21 +53,70 @@ def generate_notifications_for_patients(patients: list):
         Keep it concise (1-2 sentences), friendly, motivating, and personalized based on their profile.
         Do not use their name in the notification.
         """
+        return prompt
+    else:
+        prompt = f"""
+        You are a notification generator for a health and wellness app.
+        Create a short, positive, personalized notification text to encourage this person to move more.
 
+        Person's profile:
+        - Name: {context['name']}
+        - Age: {context['age']}
+        - Gender: {context['gender']}
+        - Job: {context['job_type']}
+        - Hobbies: {', '.join(context['hobbies']) if context['hobbies'] else 'Not specified'}
+        
+        Keep it concise (1-2 sentences), friendly, motivating, and personalized based on their profile.
+        Do not use their name in the notification.
+        """
+        return prompt
+
+
+def generate_notifications_for_patients(patients: list):
+    """
+    Generate personalized notifications for a list of patients.
+
+    Args:
+        patients: List of patient dictionaries with their full information
+
+    Returns:
+        List of generated notifications with patient info
+    """
+    notifications = []
+
+    for patient in patients:
+        # Extract relevant patient context (excluding id, firebase_token, notif_in_24h, time_to_notif, created_at)
+        probability = random.randint(1, 10)
+        was_personalized = False
+        if patient.get("group_id") == 1:
+            was_personalized = probability < 4
+        elif patient.get("group_id") == 2:
+            was_personalized = probability < 7
+        else:
+            was_personalized = probability < 10
+        prompt = prompt_builder(patient=patient, personalized=was_personalized)
         # Generate notification using OpenAI
-        response = openai_client.run(prompt=prompt)
-        notification_text = response["replies"][-1]
+        try:
+            response = openai_client.run(prompt=prompt)
+            notification_text = response["replies"][-1]
+        except Exception as e:
+            print(f"OpenAI API error for {patient.get('name')}: {str(e)}")
+            notification_text = None
 
-        notifications.append(
-            {
-                "patient_id": patient.get("id"),
-                "patient_name": patient.get("name"),
-                "firebase_token": patient.get("firebase_token"),
-                "notification_text": notification_text,
-            }
-        )
-
-        print(f"Generated notification for {context['name']}: {notification_text}")
+        if notification_text:
+            notifications.append(
+                {
+                    "patient_id": patient.get("id"),
+                    "patient_name": patient.get("name"),
+                    "firebase_token": patient.get("firebase_token"),
+                    "notification_text": notification_text,
+                    "was_personalized": was_personalized,
+                    "group_id": patient.get("group_id"),
+                }
+            )
+            print(f"Generated notification for {patient.get('name')}: {notification_text}")
+        else:
+            print(f"Skipping notification for {patient.get('name')} due to generation failure")
 
     return notifications
 
@@ -100,15 +137,19 @@ async def send_notifications_via_firebase_async(notifications: list):
     firebase_notifications = []
     for notif in notifications:
         if notif.get("firebase_token"):
-            firebase_notifications.append({
-                "token": notif["firebase_token"],
-                "title": "Time to Move!",
-                "body": notif["notification_text"],
-                "data": {
-                    "patient_id": notif["patient_id"],
-                    "patient_name": notif["patient_name"],
+            firebase_notifications.append(
+                {
+                    "token": notif["firebase_token"],
+                    "title": "Time to Move!",
+                    "body": notif["notification_text"],
+                    "data": {
+                        "patient_id": str(notif["patient_id"]),
+                        "patient_name": str(notif["patient_name"]),
+                        "was_personalized": str(notif.get("was_personalized", False)),
+                        "group_id": str(notif.get("group_id", "")),
+                    },
                 }
-            })
+            )
 
     if not firebase_notifications:
         return {
@@ -133,5 +174,17 @@ def send_notifications_via_firebase(notifications: list):
     Returns:
         Dict with sending results
     """
-    # Run async function in new event loop
-    return asyncio.run(send_notifications_via_firebase_async(notifications))
+    # Use existing event loop if available, otherwise create new one
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # If already in an async context, create a new loop in a thread
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, send_notifications_via_firebase_async(notifications))
+            return future.result()
+    else:
+        return asyncio.run(send_notifications_via_firebase_async(notifications))

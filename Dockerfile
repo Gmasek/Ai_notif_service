@@ -1,5 +1,4 @@
 FROM python:3.11-slim
-ENV OPENAI_API_KEY=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
 
 WORKDIR /app
 

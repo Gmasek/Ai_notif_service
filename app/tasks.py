@@ -1,5 +1,9 @@
 from .celery_app import celery_app
-from .pipelines import generateNotif_gpt, generate_notifications_for_patients, send_notifications_via_firebase
+from .pipelines import (
+    generateNotif_gpt,
+    generate_notifications_for_patients,
+    send_notifications_via_firebase,
+)
 from .db import SessionLocal
 from .models import Patient
 from celery import shared_task
@@ -40,6 +44,30 @@ def reset_notification_flags():
         session.close()
 
 
+def is_time_in_window(current_time: str, start_time: str, end_time: str) -> bool:
+    """
+    Check if current_time is within the time window.
+    Handles midnight crossing (e.g., 23:00 to 01:00).
+
+    Args:
+        current_time: Current time in HH:MM format
+        start_time: Window start time in HH:MM format
+        end_time: Window end time in HH:MM format
+
+    Returns:
+        True if current_time is within the window
+    """
+    if not start_time or not end_time:
+        return False
+
+    if start_time <= end_time:
+        # Normal case: e.g., 08:00 to 18:00
+        return start_time <= current_time <= end_time
+    else:
+        # Midnight crossing: e.g., 23:00 to 01:00
+        return current_time >= start_time or current_time <= end_time
+
+
 @celery_app.task(name="app.tasks.periodic_task")
 def periodic_task():
     """Task that runs every 15 minutes to check for patients needing notifications."""
@@ -74,7 +102,7 @@ def periodic_task():
                     start_time = day_config.get("start")
                     end_time = day_config.get("end")
                     # Check if current time is within the time window
-                    is_match = start_time and end_time and start_time <= current_time <= end_time
+                    is_match = is_time_in_window(current_time, start_time, end_time)
                     print(
                         f"  Time window: {start_time} - {end_time}, Current time: {current_time}, Match: {is_match}"
                     )
@@ -105,19 +133,27 @@ def periodic_task():
         notif = generate_notifications_for_patients(matching_patients)
         print(notif)
 
-        # Send notifications via Firebase
+        # Send notifications via Firebase and track which ones succeeded
+        successfully_notified = []
         if notif:
             firebase_result = send_notifications_via_firebase(notif)
             print(f"Firebase sending result: {firebase_result}")
 
-        # Mark all matching patients as notified
-        for patient in matching_patients:
-            set_notification_sent(patient["id"])
+            # Only mark patients as notified if Firebase send succeeded
+            if firebase_result.get("status") == "complete" and firebase_result.get("results"):
+                for i, result in enumerate(firebase_result["results"]):
+                    if isinstance(result, dict) and result.get("status") == "success":
+                        successfully_notified.append(notif[i]["patient_id"])
+
+        # Mark only successfully notified patients
+        for patient_id in successfully_notified:
+            set_notification_sent(patient_id)
 
         return {
             "current_day": current_day,
             "current_time": current_time,
             "matching_patients_count": len(matching_patients),
+            "successfully_notified_count": len(successfully_notified),
             "matching_patients": matching_patients,
         }
     finally:
