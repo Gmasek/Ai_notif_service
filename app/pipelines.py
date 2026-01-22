@@ -24,7 +24,30 @@ def generateNotif_gpt():
     return response["replies"][-1]
 
 
-def prompt_builder(patient: dict, personalized: bool):
+def build_contextual_information(context_data: dict) -> str:
+    """Build contextual information string from context data."""
+    return (
+        f"Today - {context_data.get('day')}, between {context_data.get('time')}, I am {context_data.get('user status')}, and the weather is {context_data.get('weather')}. "
+        f"I am mainly engaging in {context_data.get('activity')} at {context_data.get('location')}, spending a significant amount of time {context_data.get('position of body')}. My last interaction with my phone is {context_data.get('last interaction')} ago. "
+        f"I am feeling {context_data.get('mood_valence')}% well, {context_data.get('energetic_arousal')}% energetic, {context_data.get('affect_calmness')}% calm, {context_data.get('stress')}% stressed, and {context_data.get('locus_of_control')}% in control of what is happening. "
+        f"Nearby locations accessible included: {context_data.get('close_locations')}. "
+        f"Later that day, I plan the following: {context_data.get('calendar entries')}. "
+        f"Independent of my circumstances, I am {context_data.get('motivation_pa')}% motivated to engage in physical activity. My circumstances are {context_data.get('barrier_pa')}% favourable of physical activity. "
+        f"I {context_data.get('pa_scheduled_today')} intended a physical activity for today{context_data.get('pa_scheduled_today_yes', '')}{context_data.get('pa_planning_specifity_scheduled_today', '')}. "
+        f"I {context_data.get('pa_performed_today')} complete some physical activity today{context_data.get('pa_performed_today_yes', '')}. "
+        f"For tomorrow - {context_data.get('next_day_text')} - I {context_data.get('pa_scheduled_tomorrow')} intended to be physically active{context_data.get('pa_scheduled_tomorrow_yes', '')}{context_data.get('pa_planning_specifity_scheduled_tomorrow', '')}."
+    )
+
+
+def build_big5_information(context_data: dict) -> str:
+    """Build Big Five personality traits information string."""
+    return (
+        f"My big five personality traits are the following: I am {context_data.get('extraversion')}; "
+        f"{context_data.get('agreeableness')}; {context_data.get('conscientiousness')}; {context_data.get('neuroticism')}; {context_data.get('openness')}. "
+    )
+
+
+def prompt_builder(patient: dict, personalized: bool, context_data: dict = None, include_big5: bool = False):
     context = {
         "name": patient.get("name"),
         "big5": patient.get("big5"),
@@ -35,6 +58,14 @@ def prompt_builder(patient: dict, personalized: bool):
         "gender": patient.get("gender"),
         "job_type": patient.get("job_type"),
     }
+
+    # Build contextual information if provided
+    contextual_info = ""
+    if context_data:
+        contextual_info = f"\n        Current context:\n        {build_contextual_information(context_data)}"
+        if include_big5:
+            contextual_info += f"\n        {build_big5_information(context_data)}"
+
     if personalized:
         # Create personalized prompt
         prompt = f"""
@@ -49,6 +80,7 @@ def prompt_builder(patient: dict, personalized: bool):
         - Hobbies: {', '.join(context['hobbies']) if context['hobbies'] else 'Not specified'}
         - Big Five Personality Traits: {context['big5'] if context['big5'] else 'Not specified'}
         - Theory of Planned Behavior scores: {context['tpb'] if context['tpb'] else 'Not specified'}
+        {contextual_info}
 
         Keep it concise (1-2 sentences), friendly, motivating, and personalized based on their profile.
         Do not use their name in the notification.
@@ -65,19 +97,22 @@ def prompt_builder(patient: dict, personalized: bool):
         - Gender: {context['gender']}
         - Job: {context['job_type']}
         - Hobbies: {', '.join(context['hobbies']) if context['hobbies'] else 'Not specified'}
-        
+        {contextual_info}
+
         Keep it concise (1-2 sentences), friendly, motivating, and personalized based on their profile.
         Do not use their name in the notification.
         """
         return prompt
 
 
-def generate_notifications_for_patients(patients: list):
+def generate_notifications_for_patients(patients: list, context_data: dict = None, include_big5: bool = False):
     """
     Generate personalized notifications for a list of patients.
 
     Args:
         patients: List of patient dictionaries with their full information
+        context_data: Optional dict with contextual information (day, time, weather, activity, etc.)
+        include_big5: Whether to include Big Five personality traits in the prompt
 
     Returns:
         List of generated notifications with patient info
@@ -94,7 +129,7 @@ def generate_notifications_for_patients(patients: list):
             was_personalized = probability < 7
         else:
             was_personalized = probability < 10
-        prompt = prompt_builder(patient=patient, personalized=was_personalized)
+        prompt = prompt_builder(patient=patient, personalized=was_personalized, context_data=context_data, include_big5=include_big5)
         # Generate notification using OpenAI
         try:
             response = openai_client.run(prompt=prompt)
