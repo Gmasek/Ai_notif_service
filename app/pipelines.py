@@ -2,8 +2,11 @@ from haystack.components.generators import OpenAIGenerator
 from dotenv import load_dotenv
 import asyncio
 import random
+import logging
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 template = """
@@ -26,6 +29,16 @@ def generateNotif_gpt():
 
 def build_contextual_information(context_data: dict) -> str:
     """Build contextual information string from context data."""
+    missing = [k for k in (
+        "day", "time", "user status", "weather", "activity", "location",
+        "position of body", "last interaction", "mood_valence", "energetic_arousal",
+        "affect_calmness", "stress", "locus_of_control", "close_locations",
+        "calendar entries", "motivation_pa", "barrier_pa", "pa_scheduled_today",
+        "pa_performed_today", "next_day_text", "pa_scheduled_tomorrow",
+    ) if not context_data.get(k)]
+    if missing:
+        logger.warning("build_contextual_information: missing/empty keys: %s", missing)
+    logger.info("build_contextual_information raw keys present: %s", list(context_data.keys()))
     return (
         f"Today - {context_data.get('day')}, between {context_data.get('time')}, I am {context_data.get('user status')}, and the weather is {context_data.get('weather')}. "
         f"I am mainly engaging in {context_data.get('activity')} at {context_data.get('location')}, spending a significant amount of time {context_data.get('position of body')}. My last interaction with my phone is {context_data.get('last interaction')} ago. "
@@ -47,7 +60,23 @@ def build_big5_information(context_data: dict) -> str:
     )
 
 
-def prompt_builder(patient: dict, personalized: bool, context_data: dict = None, include_big5: bool = False):
+def prompt_builder(
+    patient: dict,
+    personalized: bool,
+    context_data: dict = None,
+    include_big5: bool = False,
+):
+    logger.info(
+        "prompt_builder inputs — participant=%s, personalized=%s, include_big5=%s",
+        patient.get("more_participant_id"),
+        personalized,
+        include_big5,
+    )
+    logger.info("prompt_builder patient fields: %s", {
+        k: v for k, v in patient.items() if k != "context_data"
+    })
+    logger.info("prompt_builder context_data: %s", context_data)
+
     context = {
         "name": patient.get("name"),
         "big5": patient.get("big5"),
@@ -105,7 +134,9 @@ def prompt_builder(patient: dict, personalized: bool, context_data: dict = None,
         return prompt
 
 
-def generate_notifications_for_patients(patients: list, context_data: dict = None, include_big5: bool = False):
+def generate_notifications_for_patients(
+    patients: list, context_data: dict = None, include_big5: bool = False
+):
     """
     Generate personalized notifications for a list of patients.
 
@@ -129,13 +160,30 @@ def generate_notifications_for_patients(patients: list, context_data: dict = Non
             was_personalized = probability < 7
         else:
             was_personalized = probability < 10
-        prompt = prompt_builder(patient=patient, personalized=was_personalized, context_data=context_data, include_big5=include_big5)
+        prompt = prompt_builder(
+            patient=patient,
+            personalized=was_personalized,
+            context_data=patient["context_data"],
+            include_big5=include_big5,
+        )
         # Generate notification using OpenAI
+        logger.info(
+            "LLM prompt for participant %s (group=%s, personalized=%s):\n%s",
+            patient.get("more_participant_id"),
+            patient.get("group_id"),
+            was_personalized,
+            prompt,
+        )
         try:
             response = openai_client.run(prompt=prompt)
             notification_text = response["replies"][-1]
+            logger.info(
+                "LLM response for participant %s: %s",
+                patient.get("more_participant_id"),
+                notification_text,
+            )
         except Exception as e:
-            print(f"OpenAI API error for {patient.get('name')}: {str(e)}")
+            logger.error("OpenAI API error for participant %s: %s", patient.get("more_participant_id"), str(e))
             notification_text = None
 
         if notification_text:
@@ -149,9 +197,13 @@ def generate_notifications_for_patients(patients: list, context_data: dict = Non
                     "group_id": patient.get("group_id"),
                 }
             )
-            print(f"Generated notification for {patient.get('name')}: {notification_text}")
+            print(
+                f"Generated notification for {patient.get('name')}: {notification_text}"
+            )
         else:
-            print(f"Skipping notification for {patient.get('name')} due to generation failure")
+            print(
+                f"Skipping notification for {patient.get('name')} due to generation failure"
+            )
 
     return notifications
 
@@ -218,8 +270,11 @@ def send_notifications_via_firebase(notifications: list):
     if loop and loop.is_running():
         # If already in an async context, create a new loop in a thread
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, send_notifications_via_firebase_async(notifications))
+            future = executor.submit(
+                asyncio.run, send_notifications_via_firebase_async(notifications)
+            )
             return future.result()
     else:
         return asyncio.run(send_notifications_via_firebase_async(notifications))
