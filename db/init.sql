@@ -5,12 +5,41 @@ CREATE TABLE patients (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
     more_participant_id INTEGER UNIQUE,          -- MORE study-manager participant ID
+    name                TEXT    NOT NULL DEFAULT 'unknown',
     group_id            INTEGER,                 -- A/B-test group: 0, 1, or 2
+
+    -- Profile populated from LimeSurvey baseline survey by periodic_task
+    big5                JSONB,
+    hobbies             TEXT[],
+    tpb                 JSONB,
+    time_to_notif       JSONB,                   -- {day: {start, end}} — drives notification windows
+    age                 INTEGER,
+    gender              TEXT,
+    job_type            TEXT,
+
+    -- LimeSurvey participant identifiers
+    lime_response_id    INTEGER,
+    lime_token          TEXT,
 
     notif_in_24h                BOOLEAN   DEFAULT FALSE,    -- notification already sent today
     daily_survey_triggered_at   TIMESTAMP WITH TIME ZONE,   -- when daily check-in was last triggered
 
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Evening follow-up survey responses.
+CREATE TABLE evening_followup_responses (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    more_participant_id  INTEGER,
+    submitdate           TIMESTAMP WITH TIME ZONE,
+    exercised            BOOLEAN,
+    activity             TEXT,
+    duration             TEXT,
+    when_exercised       TEXT,
+    other_activity       BOOLEAN,
+    other_activity_desc  TEXT,
+    other_duration       TEXT,
+    fetched_at           TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Sent notifications log.

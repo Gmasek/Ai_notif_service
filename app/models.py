@@ -41,6 +41,22 @@ class Patient(Base):
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
+class EveningFollowupResponse(Base):
+    __tablename__ = "evening_followup_responses"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    more_participant_id = Column(Integer, nullable=True)
+    submitdate = Column(TIMESTAMP(timezone=True), nullable=True)
+    exercised = Column(Boolean, nullable=True)
+    activity = Column(Text, nullable=True)
+    duration = Column(Text, nullable=True)
+    when_exercised = Column(Text, nullable=True)
+    other_activity = Column(Boolean, nullable=True)
+    other_activity_desc = Column(Text, nullable=True)
+    other_duration = Column(Text, nullable=True)
+    fetched_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
 class NotificationLog(Base):
     __tablename__ = "notification_logs"
 

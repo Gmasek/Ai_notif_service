@@ -21,6 +21,8 @@ NOTIFICATION_FEEDBACK_TOKEN = os.environ.get(
     "NOTIFACTION_FEEDBACK_TOKEN",
     "Mi0yLTE=.YjJkZjhjMGYtOWU5NC00NjBiLTlkNmYtNWY4NGUwNzM4NTY5",
 )
+PA_SCHEDULE_UPDATE_TOKEN = os.environ.get("PA_SCHEDULE_UPDATE_TOKEN", "")
+EVENING_FOLLOW_UP_TOKEN = os.environ.get("EVENING_FOLLOW_UP_TOKEN", "")
 MORE_STUDYMANAGER_BASE_URL = os.environ.get("MORE_STUDYMANAGER_BASE_URL", "http://host.docker.internal:8080")
 MORE_STUDY_ID = int(os.environ.get("MORE_STUDY_ID", "4"))
 INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "internal-secret-key")
@@ -34,6 +36,9 @@ def is_time_in_window(current_time: str, start_time: str, end_time: str) -> bool
     """Return True if current_time falls within [start_time, end_time], handles midnight crossing."""
     if not start_time or not end_time:
         return False
+    # Normalize to zero-padded HH:MM for correct string comparison ("9:30" → "09:30")
+    start_time = start_time.zfill(5)
+    end_time = end_time.zfill(5)
     if start_time <= end_time:
         return start_time <= current_time <= end_time
     # midnight-crossing window e.g. 23:00 → 01:00
@@ -153,7 +158,7 @@ def periodic_task():
                     age=(profile or {}).get("age"),
                     gender=(profile or {}).get("gender"),
                     job_type=(profile or {}).get("job_type"),
-                    time_to_notif=schedule,
+                    time_to_notif=schedule or (profile or {}).get("time_to_notif"),
                 ))
                 upserted += 1
             elif patient.big5 is None:
@@ -166,8 +171,9 @@ def periodic_task():
                     patient.age = profile.get("age")
                     patient.gender = profile.get("gender")
                     patient.job_type = profile.get("job_type")
-                if schedule and patient.time_to_notif is None:
-                    patient.time_to_notif = schedule
+                fallback_schedule = schedule or (profile or {}).get("time_to_notif")
+                if fallback_schedule and patient.time_to_notif is None:
+                    patient.time_to_notif = fallback_schedule
 
         session.commit()
         logger.info("periodic_task: %d new participant(s) added to DB", upserted)
@@ -352,21 +358,82 @@ def check_daily_survey_task():
         session.close()
 
 
+@celery_app.task(name="app.tasks.trigger_evening_followup_task")
+def trigger_evening_followup_task():
+    """
+    Runs nightly at 22:00.
+    Triggers the evening follow-up survey via the MORE Gateway for all participants
+    who received a notification today (notif_in_24h=True).
+    """
+    session = SessionLocal()
+    try:
+        participant_ids = [
+            p.more_participant_id
+            for p in session.query(Patient)
+            .filter(Patient.notif_in_24h == True, Patient.more_participant_id != None)
+            .all()
+        ]
+    finally:
+        session.close()
+
+    if not participant_ids:
+        logger.info("trigger_evening_followup_task: no notified participants today")
+        return {"status": "success", "triggered": 0}
+
+    result = _trigger_more_assessment(participant_ids, EVENING_FOLLOW_UP_TOKEN)
+    logger.info("trigger_evening_followup_task: triggered %d participant(s)", len(participant_ids))
+    return {"status": result.get("status"), "triggered": len(participant_ids)}
+
+
 @celery_app.task(name="app.tasks.fetch_evening_followup_task")
 def fetch_evening_followup_task():
     """
     Runs nightly at 19:30.
-    Fetches today's evening follow-up survey responses from LimeSurvey.
+    Fetches today's evening follow-up survey responses from LimeSurvey and persists them.
     """
     from .lime_fetcher import get_recent_evening_followups_from_lime
+    from .models import EveningFollowupResponse
+    from datetime import datetime, timezone
 
     try:
         records = get_recent_evening_followups_from_lime(since_hours=24)
         logger.info("fetch_evening_followup_task: %d responses", len(records))
-        return {"status": "success", "count": len(records), "records": records}
     except Exception as e:
         logger.error("fetch_evening_followup_task failed: %s", e)
         return {"status": "error", "message": str(e)}
+
+    session = SessionLocal()
+    try:
+        for r in records:
+            pid_str = r.get("participant_id") or ""
+            pid = int(pid_str.replace("participant_", "")) if pid_str.startswith("participant_") else None
+            submitdate = None
+            if r.get("submitdate"):
+                try:
+                    submitdate = datetime.strptime(r["submitdate"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
+            session.add(EveningFollowupResponse(
+                more_participant_id=pid,
+                submitdate=submitdate,
+                exercised=r.get("exercised"),
+                activity=r.get("activity"),
+                duration=r.get("duration"),
+                when_exercised=r.get("when"),
+                other_activity=r.get("other_activity"),
+                other_activity_desc=r.get("other_activity_desc"),
+                other_duration=r.get("other_duration"),
+            ))
+        session.commit()
+        logger.info("fetch_evening_followup_task: saved %d record(s)", len(records))
+    except Exception as e:
+        session.rollback()
+        logger.error("fetch_evening_followup_task: db write failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+    return {"status": "success", "count": len(records)}
 
 
 @celery_app.task(name="app.tasks.fetch_message_eval_task")
@@ -385,6 +452,62 @@ def fetch_message_eval_task():
         logger.error("fetch_message_eval_task failed: %s", e)
         return {"status": "error", "message": str(e)}
 
+
+@celery_app.task(name="app.tasks.trigger_schedule_update_survey")
+def trigger_schedule_update_survey():
+    """
+    Runs every Sunday morning at 09:00.
+    Triggers the PA schedule update survey via the MORE Gateway for all active participants.
+    """
+    session = SessionLocal()
+    try:
+        participant_ids = [
+            p.more_participant_id
+            for p in session.query(Patient).filter(Patient.more_participant_id != None).all()
+        ]
+    finally:
+        session.close()
+
+    if not participant_ids:
+        logger.info("trigger_schedule_update_survey: no participants found")
+        return {"status": "success", "triggered": 0}
+
+    result = _trigger_more_assessment(participant_ids, PA_SCHEDULE_UPDATE_TOKEN)
+    logger.info("trigger_schedule_update_survey: triggered %d participant(s)", len(participant_ids))
+    return {"status": result.get("status"), "triggered": len(participant_ids)}
+
+
+@celery_app.task(name="app.tasks.update_schedule_fields_task")
+def update_schedule_fields_task():
+    """
+    Runs every Sunday at 23:59.
+    Fetches the latest PA schedules from LimeSurvey and updates time_to_notif
+    for all matching participants in the patients table.
+    """
+    from .lime_fetcher import get_all_schedules_from_lime
+
+    schedules = get_all_schedules_from_lime()
+    logger.info("update_schedule_fields_task: %d schedule(s) fetched from LimeSurvey", len(schedules))
+
+    session = SessionLocal()
+    updated = 0
+    try:
+        for pid, schedule in schedules.items():
+            if not schedule:
+                continue
+            patient = session.query(Patient).filter(Patient.more_participant_id == pid).first()
+            if patient:
+                patient.time_to_notif = schedule
+                updated += 1
+        session.commit()
+        logger.info("update_schedule_fields_task: %d patient(s) updated", updated)
+        return {"status": "success", "updated": updated}
+    except Exception as e:
+        session.rollback()
+        logger.error("update_schedule_fields_task failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
 
 
 def data_fill(data: dict) -> dict:

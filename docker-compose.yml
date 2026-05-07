@@ -7,7 +7,6 @@ services:
     ports:
       - "8550:8550"
     depends_on:
-      - redis
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
@@ -17,12 +16,14 @@ services:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
       - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
+    networks:
+      - default
+      - more_platform
 
   worker:
     build: .
     command: celery -A app.celery_app worker -l info
     depends_on:
-      - redis
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
@@ -32,12 +33,14 @@ services:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
       - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
+    networks:
+      - default
+      - more_platform
 
   beat:
     build: .
     command: celery -A app.celery_app beat -l info
     depends_on:
-      - redis
       - db
     volumes:
       - ./firebase-service-account.json:/app/firebase-service-account.json:ro
@@ -47,6 +50,9 @@ services:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
       - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
+    networks:
+      - default
+      - more_platform
 
   db:
     image: postgres:16
@@ -59,18 +65,17 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
-    ports:
-      - "5433:5432" # remove in prod
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7
-    ports:
-      - "6380:6379"
-
 volumes:
   postgres_data:
+
+networks:
+  default: {}
+  more_platform:
+    external: true
+    name: traefik_default

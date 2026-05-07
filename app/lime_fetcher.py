@@ -8,6 +8,7 @@ http://host.docker.internal:8081/admin/remotecontrol) from inside Docker.
 Participant identity: LimeSurvey stores the MORE participant ID as the token's
 'firstname' field (set by studymanager when activating participants).
 """
+
 import base64
 import json
 import logging
@@ -26,20 +27,31 @@ LIME_ADMIN_USER = os.environ.get("LIME_ADMIN_USER", "admin")
 LIME_ADMIN_PWD = os.environ.get("LIME_ADMIN_PWD", "admin")
 
 LIME_BASELINE_SURVEY_ID = int(os.environ.get("LIME_BASELINE_SURVEY_ID", "589661"))
-LIME_DAILY_CHECKIN_SURVEY_ID = int(os.environ.get("LIME_DAILY_CHECKIN_SURVEY_ID", "474444"))
+LIME_DAILY_CHECKIN_SURVEY_ID = int(
+    os.environ.get("LIME_DAILY_CHECKIN_SURVEY_ID", "474444")
+)
 LIME_PA_SCHEDULE_SURVEY_ID = int(os.environ.get("LIME_PA_SCHEDULE_SURVEY_ID", "537526"))
-LIME_EVENING_FOLLOWUP_SURVEY_ID = int(os.environ.get("LIME_EVENING_FOLLOWUP_SURVEY_ID", "844354"))
-LIME_MESSAGE_EVAL_SURVEY_ID = int(os.environ.get("LIME_MESSAGE_EVAL_SURVEY_ID", "159126"))
+LIME_EVENING_FOLLOWUP_SURVEY_ID = int(
+    os.environ.get("LIME_EVENING_FOLLOWUP_SURVEY_ID", "844354")
+)
+LIME_MESSAGE_EVAL_SURVEY_ID = int(
+    os.environ.get("LIME_MESSAGE_EVAL_SURVEY_ID", "159126")
+)
 
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_session_key() -> str:
     resp = requests.post(
         LIME_REMOTE_URL,
-        json={"method": "get_session_key", "params": [LIME_ADMIN_USER, LIME_ADMIN_PWD], "id": 1},
+        json={
+            "method": "get_session_key",
+            "params": [LIME_ADMIN_USER, LIME_ADMIN_PWD],
+            "id": 1,
+        },
         headers={"Content-Type": "application/json"},
         timeout=10,
     )
@@ -74,11 +86,11 @@ def _export_responses(sk: str, survey_id: int) -> list:
             "params": [
                 sk,
                 survey_id,
-                "json",      # sDocumentType
-                None,        # sLanguageCode — default language
+                "json",  # sDocumentType
+                None,  # sLanguageCode — default language
                 "complete",  # sCompletionStatus
-                "code",      # sHeadingType — short codes matching lime_parser expectations
-                "short",     # sResponseType
+                "code",  # sHeadingType — short codes matching lime_parser expectations
+                "short",  # sResponseType
             ],
             "id": 1,
         },
@@ -88,7 +100,9 @@ def _export_responses(sk: str, survey_id: int) -> list:
     resp.raise_for_status()
     raw = resp.json().get("result")
     if not raw or isinstance(raw, dict):
-        logger.info("_export_responses: no data for survey %d (result=%s)", survey_id, raw)
+        logger.info(
+            "_export_responses: no data for survey %d (result=%s)", survey_id, raw
+        )
         return []
     try:
         decoded = base64.b64decode(raw)
@@ -107,9 +121,9 @@ def _list_participants(sk: str, survey_id: int) -> list:
             "params": [
                 sk,
                 survey_id,
-                0,     # iStart
+                0,  # iStart
                 1000,  # iLimit
-                False, # bUnused — False = all participants, True = only unused
+                False,  # bUnused — False = all participants, True = only unused
                 ["token", "firstname", "completed"],  # aAttributes
             ],
             "id": 1,
@@ -147,8 +161,14 @@ def _build_token_to_pid(sk: str, survey_id: int) -> dict:
 # Profile parsing helpers (same logic as elastic_queries.get_patient_profile)
 # ---------------------------------------------------------------------------
 
+
 def _parse_profile(lime_data: dict, pid: int) -> dict:
-    from .lime_parser import parse_bigfive, parse_g05q40_tpb, parse_breq3, parse_hobbies
+    from .lime_parser import (
+        parse_bigfive,
+        parse_g05q40_tpb,
+        parse_breq3,
+        parse_time_to_notif,
+    )
 
     name = lime_data.get("G01Q36") or f"participant_{pid}"
     age = None
@@ -169,7 +189,7 @@ def _parse_profile(lime_data: dict, pid: int) -> dict:
         "job_type": job_type,
         "big5": parse_bigfive(lime_data),
         "tpb": tpb or None,
-        "hobbies": parse_hobbies(lime_data),
+        "time_to_notif": parse_time_to_notif(lime_data),
     }
 
 
@@ -197,6 +217,7 @@ def _parse_checkin(lime_data: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Public bulk functions — fetch all participants in one session
 # ---------------------------------------------------------------------------
+
 
 def get_all_baseline_profiles_from_lime() -> dict:
     """
@@ -252,7 +273,9 @@ def get_all_schedules_from_lime() -> dict:
 def get_all_todays_checkins_from_lime() -> dict:
     """
     Return {more_participant_id: context_dict} for every participant who has
-    completed today's check-in survey.  One session key + two API calls.
+    a completed check-in survey response submitted today.  One session key + two API calls.
+
+    Date filtering uses 'datestamp' (preferred) or 'submitdate' as fallback.
     """
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -265,20 +288,23 @@ def get_all_todays_checkins_from_lime() -> dict:
 
     checkins = {}
     for r in responses:
-        if not str(r.get("submitdate", "")).startswith(today):
+        if not str(r.get("submitdate") or "").startswith(today):
             continue
         pid = t2pid.get(r.get("token"))
         if pid is None:
             continue
         checkins[pid] = _parse_checkin(r)
 
-    logger.info("get_all_todays_checkins_from_lime: %d check-in(s) today", len(checkins))
+    logger.info(
+        "get_all_todays_checkins_from_lime: %d check-in(s) found", len(checkins)
+    )
     return checkins
 
 
 # ---------------------------------------------------------------------------
 # Per-participant helpers — convenience wrappers around bulk functions
 # ---------------------------------------------------------------------------
+
 
 def get_patient_profile_from_lime(more_participant_id: int) -> Optional[dict]:
     """
@@ -324,18 +350,24 @@ def get_recent_evening_followups_from_lime(since_hours: int = 24) -> list:
         if str(r.get("submitdate", "")) < since_str:
             continue
         pid = t2pid.get(r.get("token"))
-        records.append({
-            "participant_id": f"participant_{pid}" if pid else None,
-            "submitdate": r.get("submitdate"),
-            "exercised": r.get("Q00") == "Y",
-            "activity": r.get("G00Q02"),
-            "duration": r.get("G00Q03"),
-            "when": r.get("G00Q08"),
-            "other_activity": r.get("G00Q05") == "Y",
-            "other_activity_desc": r.get("G00Q06"),
-            "other_duration": r.get("G00Q07"),
-        })
-    logger.info("get_recent_evening_followups_from_lime: %d response(s) in last %dh", len(records), since_hours)
+        records.append(
+            {
+                "participant_id": f"participant_{pid}" if pid else None,
+                "submitdate": r.get("submitdate"),
+                "exercised": r.get("Q00") == "Y",
+                "activity": r.get("G00Q02"),
+                "duration": r.get("G00Q03"),
+                "when": r.get("G00Q08"),
+                "other_activity": r.get("G00Q05") == "Y",
+                "other_activity_desc": r.get("G00Q06"),
+                "other_duration": r.get("G00Q07"),
+            }
+        )
+    logger.info(
+        "get_recent_evening_followups_from_lime: %d response(s) in last %dh",
+        len(records),
+        since_hours,
+    )
     return records
 
 
@@ -360,12 +392,27 @@ def get_recent_message_evals_from_lime(since_hours: int = 24) -> list:
             continue
         pid = t2pid.get(r.get("token"))
         # Return all question fields (exclude LimeSurvey metadata fields)
-        meta = {"id", "submitdate", "lastpage", "startlanguage", "seed", "token", "startdate", "datestamp"}
+        meta = {
+            "id",
+            "submitdate",
+            "lastpage",
+            "startlanguage",
+            "seed",
+            "token",
+            "startdate",
+            "datestamp",
+        }
         data = {k: v for k, v in r.items() if k not in meta}
-        records.append({
-            "participant_id": f"participant_{pid}" if pid else None,
-            "submitdate": r.get("submitdate"),
-            "data": data,
-        })
-    logger.info("get_recent_message_evals_from_lime: %d response(s) in last %dh", len(records), since_hours)
+        records.append(
+            {
+                "participant_id": f"participant_{pid}" if pid else None,
+                "submitdate": r.get("submitdate"),
+                "data": data,
+            }
+        )
+    logger.info(
+        "get_recent_message_evals_from_lime: %d response(s) in last %dh",
+        len(records),
+        since_hours,
+    )
     return records

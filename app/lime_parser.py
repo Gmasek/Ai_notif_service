@@ -1,10 +1,10 @@
 """
 Parser for LimeSurvey response data to Patient model format.
 """
+
 import re
 import random
 from typing import Optional
-
 
 # Map msgdays SQ codes to day names
 DAY_MAP = {
@@ -55,7 +55,7 @@ def parse_time_range(time_str: str) -> Optional[dict]:
 
     match = re.match(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", time_str.strip())
     if match:
-        return {"start": match.group(1), "end": match.group(2)}
+        return {"start": match.group(1).zfill(5), "end": match.group(2).zfill(5)}
     return None
 
 
@@ -128,7 +128,7 @@ def parse_bigfive(lime_data: dict) -> dict:
         # Add reverse-scored items (6 - score)
         for item in scoring["reverse"]:
             if item in raw_scores:
-                total += (6 - raw_scores[item])
+                total += 6 - raw_scores[item]
 
         big5[trait] = total
 
@@ -202,36 +202,36 @@ def parse_time_to_notif(lime_data: dict) -> dict:
     return time_to_notif if time_to_notif else None
 
 
-def parse_hobbies(lime_data: dict, rating_threshold: int = 4) -> list:
-    """
-    Parse activity/hobby fields into a list of activity names.
-
-    Supports two survey formats:
-    - Checkbox format: patype[SQ001] == "Y"
-    - Rating scale format: G07Q33[SQ001] with AO01-AO07 values; activities rated
-      >= rating_threshold (default 4) are included.
-    """
-    hobbies = []
-
-    for sq_code, activity_name in ACTIVITY_MAP.items():
-        # Checkbox format (patype)
-        if lime_data.get(f"patype[{sq_code}]") == "Y":
-            hobbies.append(activity_name)
-            continue
-
-        # Rating scale format (G07Q33)
-        raw = lime_data.get(f"G07Q33[{sq_code}]")
-        if raw:
-            score = _AO_MAP.get(raw)
-            if score is not None and score >= rating_threshold:
-                hobbies.append(activity_name)
-
-    # Add custom "other" activity if specified
-    other_activity = lime_data.get("patype[other]") or lime_data.get("tapaother")
-    if other_activity and other_activity.strip():
-        hobbies.append(other_activity.strip())
-
-    return hobbies if hobbies else None
+# def parse_hobbies(lime_data: dict, rating_threshold: int = 4) -> list:
+#    """
+#    Parse activity/hobby fields into a list of activity names.
+#
+#    Supports two survey formats:
+#    - Checkbox format: patype[SQ001] == "Y"
+#    - Rating scale format: G07Q33[SQ001] with AO01-AO07 values; activities rated
+#      >= rating_threshold (default 4) are included.
+#    """
+#    hobbies = []
+#
+#    for sq_code, activity_name in ACTIVITY_MAP.items():
+#        # Checkbox format (patype)
+#        if lime_data.get(f"patype[{sq_code}]") == "Y":
+#            hobbies.append(activity_name)
+#            continue
+#
+#        # Rating scale format (G07Q33)
+#        raw = lime_data.get(f"G07Q33[{sq_code}]")
+#        if raw:
+#            score = _AO_MAP.get(raw)
+#            if score is not None and score >= rating_threshold:
+#                hobbies.append(activity_name)
+#
+#    # Add custom "other" activity if specified
+#    other_activity = lime_data.get("patype[other]") or lime_data.get("tapaother")
+#    if other_activity and other_activity.strip():
+#        hobbies.append(other_activity.strip())
+#
+#    return hobbies if hobbies else None
 
 
 def parse_limesurvey_to_patient(
