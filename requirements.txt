@@ -1,6 +1,7 @@
 celery[redis]
 torch
 haystack-ai
+anthropic-haystack
 redis
 transformers[torch,sentencepiece]
 accelerate

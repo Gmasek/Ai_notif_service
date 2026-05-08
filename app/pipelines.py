@@ -1,4 +1,5 @@
-from haystack.components.generators import OpenAIGenerator
+from haystack_integrations.components.generators.anthropic import AnthropicChatGenerator
+from haystack.dataclasses import ChatMessage
 from dotenv import load_dotenv
 import asyncio
 import random
@@ -9,7 +10,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-openai_client = OpenAIGenerator(model="gpt-4o-mini")
+anthropic_client = AnthropicChatGenerator(model="claude-opus-4-7")
 
 
 # ── Big Five adjective tables (ported from Prompt_Comparison.py) ──────────────
@@ -415,17 +416,18 @@ def generate_notifications_for_patients(
         )
         # Generate notification using OpenAI
         logger.info(
-            "calling OpenAI for participant=%s group=%s personalized=%s model=gpt-4o-mini",
+            "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
             patient.get("more_participant_id"),
             patient.get("group_id"),
             was_personalized,
         )
         try:
-            response = openai_client.run(
-                prompt=prompt_parts["user"],
-                system_prompt=prompt_parts["system"],
-            )
-            notification_text = response["replies"][-1]
+            messages = [
+                ChatMessage.from_system(prompt_parts["system"]),
+                ChatMessage.from_user(prompt_parts["user"]),
+            ]
+            response = anthropic_client.run(messages=messages)
+            notification_text = response["replies"][-1].text
             logger.info(
                 "LLM response for participant %s: %s",
                 patient.get("more_participant_id"),
@@ -433,7 +435,7 @@ def generate_notifications_for_patients(
             )
         except Exception as e:
             logger.error(
-                "OpenAI API error for participant %s: %s",
+                "Anthropic API error for participant %s: %s",
                 patient.get("more_participant_id"),
                 str(e),
             )
