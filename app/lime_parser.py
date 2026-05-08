@@ -3,7 +3,6 @@ Parser for LimeSurvey response data to Patient model format.
 """
 
 import re
-import random
 from typing import Optional
 
 # Map msgdays SQ codes to day names
@@ -288,7 +287,7 @@ def parse_limesurvey_to_patient(
         "big5": parse_bigfive(lime_data),
         "tpb": tpb,
         "hobbies": parse_hobbies(lime_data),
-        "group_id": random.randint(0, 2),
+        "group_id": int(participant_id) % 3,
         "time_to_notif": parse_time_to_notif(lime_data),
         "notif_in_24h": False,
     }

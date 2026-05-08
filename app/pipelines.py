@@ -401,13 +401,13 @@ def generate_notifications_for_patients(
     for patient in patients:
         # Extract relevant patient context (excluding id, firebase_token, notif_in_24h, time_to_notif, created_at)
         probability = random.randint(1, 10)
-        was_personalized = False
+        logger.info(f"Number generated for personalisation {probability}")
         if patient.get("group_id") == 1:
-            was_personalized = probability < 4
+            was_personalized = probability <= 3
         elif patient.get("group_id") == 2:
-            was_personalized = probability < 7
-        else:
-            was_personalized = probability < 10
+            was_personalized = probability <= 6
+        else:  # groupid 0
+            was_personalized = probability <= 9
         prompt_parts = prompt_builder(
             patient=patient,
             personalized=was_personalized,

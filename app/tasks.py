@@ -1,8 +1,10 @@
 import os
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
+
+SERVER_TZ_OFFSET = timedelta(hours=2)
 
 from .celery_app import celery_app
 from .db import SessionLocal
@@ -173,7 +175,7 @@ def periodic_task():
                     Patient(
                         more_participant_id=pid,
                         name=(profile or {}).get("name") or f"participant_{pid}",
-                        group_id=random.randint(0, 2),
+                        group_id=pid % 3,
                         big5=(profile or {}).get("big5"),
                         hobbies=(profile or {}).get("hobbies"),
                         tpb=(profile or {}).get("tpb"),
@@ -231,8 +233,9 @@ def check_daily_survey_task():
     from .lime_fetcher import get_all_todays_checkins_from_lime
     from .pipelines import generate_notifications_for_patients
 
-    current_time = datetime.now().strftime("%H:%M")
-    current_day = datetime.now().strftime("%A").lower()
+    local_now = datetime.utcnow() + SERVER_TZ_OFFSET
+    current_time = local_now.strftime("%H:%M")
+    current_day = local_now.strftime("%A").lower()
 
     # Fetch all of today's check-ins from LimeSurvey in one batch call
     todays_checkins = get_all_todays_checkins_from_lime()
