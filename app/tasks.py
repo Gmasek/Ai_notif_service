@@ -5,10 +5,8 @@ from datetime import datetime
 from typing import Optional
 
 from .celery_app import celery_app
-from .pipelines import generateNotif_gpt
 from .db import SessionLocal
 from .models import Patient, NotificationLog
-from celery import shared_task
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +92,6 @@ def _trigger_more_assessment(participant_ids: list, more_token: str) -> dict:
 # ---------------------------------------------------------------------------
 # Scheduled tasks
 # ---------------------------------------------------------------------------
-
-@celery_app.task(name="app.tasks.ask_question")
-def ask_question():
-    result = generateNotif_gpt()
-    return result
-
 
 @celery_app.task(name="app.tasks.reset_notification_flags")
 def reset_notification_flags():
@@ -508,54 +500,3 @@ def update_schedule_fields_task():
         return {"status": "error", "message": str(e)}
     finally:
         session.close()
-
-
-def data_fill(data: dict) -> dict:
-    """
-    Create or update a participant's state record in PostgreSQL.
-
-    Accepts: more_participant_id (required), group_id.
-    """
-    from pydantic import BaseModel
-    from typing import Optional
-
-    class ParticipantInput(BaseModel):
-        more_participant_id: int
-        group_id: Optional[int] = None
-
-    participant_input = ParticipantInput(**data)
-
-    session = SessionLocal()
-    try:
-        patient = (
-            session.query(Patient)
-            .filter(Patient.more_participant_id == participant_input.more_participant_id)
-            .first()
-        )
-        if patient:
-            if participant_input.group_id is not None:
-                patient.group_id = participant_input.group_id
-        else:
-            patient = Patient(
-                more_participant_id=participant_input.more_participant_id,
-                name=f"participant_{participant_input.more_participant_id}",
-                group_id=participant_input.group_id if participant_input.group_id is not None else random.randint(0, 2),
-            )
-            session.add(patient)
-
-        session.commit()
-        session.refresh(patient)
-
-        return {
-            "id": str(patient.id),
-            "more_participant_id": patient.more_participant_id,
-            "group_id": patient.group_id,
-            "notif_in_24h": patient.notif_in_24h,
-        }
-    finally:
-        session.close()
-
-
-@shared_task
-def data_fill_task(data):
-    return data_fill(data=data)

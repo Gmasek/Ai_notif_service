@@ -1,14 +1,10 @@
-fastapi
-uvicorn[standard]
 celery[redis]
 torch
-haystack-ai  # minimal Haystack setup
+haystack-ai
 redis
 transformers[torch,sentencepiece]
 accelerate
 sqlalchemy
 psycopg[binary]
 psycopg2-binary
-firebase-admin  # Firebase Cloud Messaging
-elasticsearch>=8.0.0,<9.0.0  # Elasticsearch Python client
-python-dotenv         # load .env.local for check_elastic.py
+python-dotenv

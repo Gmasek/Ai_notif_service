@@ -181,15 +181,6 @@ _CONTEXT_TEMPLATE = (
 )
 
 
-### Simple llm generation with prompt using template
-### Can do Async later, but i dont think its necessary
-## No context
-def generateNotif_gpt():
-    response = openai_client.run(prompt=_SYSTEM_PROMPT)
-    print(response["replies"][-1])
-    return response["replies"][-1]
-
-
 def build_contextual_information(context_data: dict) -> str:
     """Build contextual information string from context data, skipping unavailable fields."""
     missing = [
@@ -468,75 +459,3 @@ def generate_notifications_for_patients(
             )
 
     return notifications
-
-
-async def send_notifications_via_firebase_async(notifications: list):
-    """
-    Send generated notifications via Firebase Cloud Messaging asynchronously.
-
-    Args:
-        notifications: List of notification dicts from generate_notifications_for_patients
-
-    Returns:
-        Dict with sending results
-    """
-    from .firebase_messaging import send_batch_notifications_async
-
-    # Convert notification format to Firebase format
-    firebase_notifications = []
-    for notif in notifications:
-        if notif.get("firebase_token"):
-            firebase_notifications.append(
-                {
-                    "token": notif["firebase_token"],
-                    "title": "Time to Move!",
-                    "body": notif["notification_text"],
-                    "data": {
-                        "patient_id": str(notif["patient_id"]),
-                        "patient_name": str(notif["patient_name"]),
-                        "was_personalized": str(notif.get("was_personalized", False)),
-                        "group_id": str(notif.get("group_id", "")),
-                    },
-                }
-            )
-
-    if not firebase_notifications:
-        return {
-            "status": "skipped",
-            "message": "No valid Firebase tokens found",
-            "success_count": 0,
-            "failure_count": 0,
-        }
-
-    # Send all notifications
-    result = await send_batch_notifications_async(firebase_notifications)
-    return result
-
-
-def send_notifications_via_firebase(notifications: list):
-    """
-    Synchronous wrapper for sending notifications via Firebase.
-
-    Args:
-        notifications: List of notification dicts from generate_notifications_for_patients
-
-    Returns:
-        Dict with sending results
-    """
-    # Use existing event loop if available, otherwise create new one
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # If already in an async context, create a new loop in a thread
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(
-                asyncio.run, send_notifications_via_firebase_async(notifications)
-            )
-            return future.result()
-    else:
-        return asyncio.run(send_notifications_via_firebase_async(notifications))

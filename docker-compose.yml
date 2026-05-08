@@ -1,38 +1,16 @@
 version: "3.9"
 
 services:
-  api:
-    build: .
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8550
-    ports:
-      - "8550:8550"
-    depends_on:
-      - db
-    volumes:
-      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
-    env_file:
-      - .env.local
-    environment:
-      - PYTHONUNBUFFERED=1
-      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
-      - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
-    networks:
-      - default
-      - more_platform
-
   worker:
     build: .
     command: celery -A app.celery_app worker -l info
     depends_on:
       - db
-    volumes:
-      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
     env_file:
       - .env.local
     environment:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
-      - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
     networks:
       - default
       - more_platform
@@ -42,14 +20,11 @@ services:
     command: celery -A app.celery_app beat -l info
     depends_on:
       - db
-    volumes:
-      - ./firebase-service-account.json:/app/firebase-service-account.json:ro
     env_file:
       - .env.local
     environment:
       - PYTHONUNBUFFERED=1
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/app_db
-      - FIREBASE_SERVICE_ACCOUNT_PATH=/app/firebase-service-account.json
     networks:
       - default
       - more_platform
