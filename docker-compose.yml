@@ -5,7 +5,8 @@ services:
     build: .
     command: celery -A app.celery_app worker -l info
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file:
       - .env.local
     environment:
@@ -14,12 +15,19 @@ services:
     networks:
       - default
       - more_platform
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
 
   beat:
     build: .
     command: celery -A app.celery_app beat -l info
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file:
       - .env.local
     environment:
@@ -28,6 +36,12 @@ services:
     networks:
       - default
       - more_platform
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' > /dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   db:
     image: postgres:16
