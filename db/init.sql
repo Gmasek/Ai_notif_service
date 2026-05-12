@@ -51,3 +51,24 @@ CREATE TABLE notification_logs (
     group_id             INTEGER,
     sent_at              TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Today's check-in data cached from LimeSurvey. One row per participant, cleared at daily reset.
+CREATE TABLE daily_checkins (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    more_participant_id  INTEGER UNIQUE NOT NULL,
+    checkin_data         JSONB   NOT NULL,
+    fetched_at           TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- LLM-generated notification for today. One row per participant, cleared at daily reset.
+-- Persisted before send so retries reuse the text instead of re-calling the LLM.
+CREATE TABLE generated_notifications (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    more_participant_id  INTEGER UNIQUE NOT NULL,
+    notification_text    TEXT    NOT NULL,
+    was_personalized     BOOLEAN DEFAULT FALSE,
+    group_id             INTEGER,
+    send_status          TEXT    DEFAULT 'pending',  -- pending / sent / failed
+    generated_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    sent_at              TIMESTAMP WITH TIME ZONE
+);

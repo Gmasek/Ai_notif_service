@@ -66,3 +66,28 @@ class NotificationLog(Base):
     big5_used = Column(Boolean, default=False)
     group_id = Column(Integer, nullable=True)
     sent_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class DailyCheckin(Base):
+    """Today's check-in data cached from LimeSurvey. One row per participant, cleared at daily reset."""
+    __tablename__ = "daily_checkins"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    more_participant_id = Column(Integer, unique=True, nullable=False)
+    checkin_data = Column(JSONB, nullable=False)
+    fetched_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class GeneratedNotification(Base):
+    """LLM-generated notification for today. One row per participant, cleared at daily reset.
+    Persisted before send so retries reuse the text instead of re-calling the LLM."""
+    __tablename__ = "generated_notifications"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    more_participant_id = Column(Integer, unique=True, nullable=False)
+    notification_text = Column(Text, nullable=False)
+    was_personalized = Column(Boolean, default=False)
+    group_id = Column(Integer, nullable=True)
+    send_status = Column(Text, default="pending")  # pending / sent / failed
+    generated_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    sent_at = Column(TIMESTAMP(timezone=True), nullable=True)

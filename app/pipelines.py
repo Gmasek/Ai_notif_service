@@ -2,6 +2,7 @@ from haystack_integrations.components.generators.anthropic import AnthropicChatG
 from haystack.dataclasses import ChatMessage
 from dotenv import load_dotenv
 import asyncio
+import json
 import random
 import logging
 
@@ -14,6 +15,70 @@ anthropic_client = AnthropicChatGenerator(model="claude-opus-4-7")
 
 
 # ── Big Five adjective tables (ported from Prompt_Comparison.py) ──────────────
+_TRAIT_INFO = {
+    "extraversion": {
+        "label": "Extraversion",
+        "definition": "a tendency to seek stimulation in the company of others",
+        "high": "extroverted, excitement seeking, attention seeking, "
+        "outgoing, warm, seeking adventure, enthusiastic in groups, "
+        "often energized by social situations, happy to be the "
+        "center of attention",
+        "low": "socially withdrawn, detached coldness, quiet, reserved, "
+        "prefers solitary or small-group settings, fatigued by too "
+        "much social interaction, reflective",
+    },
+    "agreeableness": {
+        "label": "Agreeableness",
+        "definition": "a tendency to be compassionate and cooperative "
+        "towards others",
+        "high": "submissiveness, selflessness, gullibility, helpful, "
+        "trusting/forgiving, empathetic, supportive, team-oriented, "
+        "straightforward, altruistic, compliant, modest, sympathetic",
+        "low": "deceitfulness, manipulativeness, callousness, critical, "
+        "uncooperative, suspicious, competitive, skeptical, "
+        "demanding, insulting, stubborn, show-offs, unsympathetic, "
+        "less caring",
+    },
+    "conscientiousness": {
+        "label": "Conscientiousness",
+        "definition": "a tendency that a person acts in an organized or "
+        "spontaneous way",
+        "high": "perfectionism, workaholism, hardworking, dependable, "
+        "organized, reliable, persistent, good at planning, "
+        "competent, dutiful, achievement-striving, "
+        "self-disciplined, considerate",
+        "low": "distractibility, irresponsibility, rashness, impulsive, "
+        "careless, disorganized, easily distracted, less structured, "
+        "incompetent, procrastinator, undisciplined",
+    },
+    "neuroticism": {
+        "label": "Neuroticism",
+        "definition": "the extent to which a person's emotion is sensitive "
+        "to the environment",
+        "high": "depressivity, emotional lability, shamefulness, anxious, "
+        "unhappy, prone to negative emotions, prone to worry, mood "
+        "swings, very stressed, may experience anxiety more "
+        "frequently, hostile (irritable), self-conscious (shy), "
+        "vulnerable, experiencing dramatic shifts in mood",
+        "low": "fearlessness, shamelessness, calm, even-tempered, secure, "
+        "generally calm, secure, and resilient when facing "
+        "challenges, laid back, emotionally stable, confident, "
+        "rarely sad or depressed",
+    },
+    "openness": {
+        "label": "Openness",
+        "definition": "the extent to which a person is open to experience a "
+        "variety of activities",
+        "high": "magical thinking, eccentricity, curious, wide range of "
+        "interests, independent, enjoys variety, embraces change, "
+        "likely to engage in creative or unconventional pursuits, "
+        "imaginative, open to trying new things",
+        "low": "inflexible, close-minded, practical, conventional, prefers "
+        "routine, prefers routine and tradition, values practicality "
+        "over novelty, predictable, not very imaginative, "
+        "uncomfortable with change, strict with routine, traditional",
+    },
+}
 
 ADJECTIVE_MARKERS: dict[str, list[tuple[str, str]]] = {
     "extraversion": [
@@ -163,6 +228,28 @@ _PERSONALITY_TEMPLATE = (
     "the most salient ones.\n\n"
     "CRITICAL: Do NOT mention the user's personality traits, this description, or that you are "
     "adapting your style in any way."
+)
+
+_PERSONALITY_TEMPLATE_2 = (
+    "\n\n=== PERSONALITY ADAPTATION (HIGHEST PRIORITY) ===\n\n"
+    "You are speaking to a specific user whose personality is described "
+    "below in three complementary forms: adjectives, numeric scores, "
+    "and a trait reference. Integrate ALL three when shaping how you "
+    "communicate.\n\n"
+    "{description}"
+    f"{json.dumps(_TRAIT_INFO, indent=2)}\n\n"
+    "Adapt your communication style — tone, word choice, framing, "
+    "energy level, structure, and emotional register — to match this "
+    "profile. You absolutely must take into account the COMBINATION of traits, not just "
+    "one in isolation: a user high on Conscientiousness AND high on "
+    "Neuroticism communicates differently than one high on "
+    "Conscientiousness alone.\n\n"
+    "This adaptation has SUPERIOR PRIORITY over all other style "
+    "guidance in this prompt. When in doubt, favour the personality "
+    "profile.\n\n"
+    "CRITICAL: Do NOT mention the user's personality, scores, this "
+    "description, or that you are adapting. The adaptation must be "
+    "invisible."
 )
 
 _CONTEXT_TEMPLATE = (
@@ -334,12 +421,14 @@ def prompt_builder(
         )
         if all(v is not None for v in scores.values()):
             desc = _scores_to_description(scores)
+            if include_big5:
+                desc = desc + "\n\nRaw Big Five scores: " + build_big5_information(big5)
             logger.info(
                 "prompt_builder [participant=%s] personality adjective description:\n  %s",
                 pid,
                 desc,
             )
-            system_parts.append(_PERSONALITY_TEMPLATE.replace("{description}", desc))
+            system_parts.append(_PERSONALITY_TEMPLATE_2.replace("{description}", desc))
         else:
             logger.warning(
                 "prompt_builder [participant=%s] incomplete big5 scores — "
@@ -414,12 +503,17 @@ def generate_notifications_for_patients(
             context_data=patient["context_data"],
             include_big5=include_big5,
         )
-        # Generate notification using OpenAI
         logger.info(
             "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
             patient.get("more_participant_id"),
             patient.get("group_id"),
             was_personalized,
+        )
+        logger.info(
+            "FULL PROMPT for participant=%s\n--- SYSTEM ---\n%s\n--- USER ---\n%s",
+            patient.get("more_participant_id"),
+            prompt_parts["system"],
+            prompt_parts["user"],
         )
         try:
             messages = [
@@ -452,12 +546,15 @@ def generate_notifications_for_patients(
                     "group_id": patient.get("group_id"),
                 }
             )
-            print(
-                f"Generated notification for {patient.get('name')}: {notification_text}"
+            logger.info(
+                "Generated notification for %s: %s",
+                patient.get("name"),
+                notification_text,
             )
         else:
-            print(
-                f"Skipping notification for {patient.get('name')} due to generation failure"
+            logger.warning(
+                "Skipping notification for %s due to generation failure",
+                patient.get("name"),
             )
 
     return notifications

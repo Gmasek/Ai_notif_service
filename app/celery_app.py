@@ -25,11 +25,16 @@ celery_app.conf.beat_schedule = {
     # Every midnight: reset daily notification flags
     "reset-notifications-at-midnight": {
         "task": "app.tasks.reset_notification_flags",
-        "schedule": crontab(hour=22, minute=0),
+        "schedule": crontab(hour=2, minute=0),
     },
-    # Every 5 minutes: generate and send notifications for completed check-ins
-    "check-daily-survey-every-5min": {
-        "task": "app.tasks.check_daily_survey_task",
+    # Every 5 minutes: fetch check-ins from LimeSurvey and trigger momentary assessment
+    "get-momentary-assessment-every-5min": {
+        "task": "app.tasks.get_momentary_assessment_task",
+        "schedule": 150.0,
+    },
+    # Every 5 minutes: generate and send notifications for participants with check-in data
+    "send-notifications-every-5min": {
+        "task": "app.tasks.send_notifications_task",
         "schedule": 150.0,
     },
     # Nightly: trigger evening follow-up survey for participants notified today

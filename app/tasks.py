@@ -1,14 +1,14 @@
 import os
 import logging
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 SERVER_TZ_OFFSET = timedelta(hours=2)
 
 from .celery_app import celery_app
 from .db import SessionLocal
-from .models import Patient, NotificationLog
+from .models import Patient, NotificationLog, DailyCheckin, GeneratedNotification
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +119,12 @@ def reset_notification_flags():
     try:
         updated_count = (
             session.query(Patient)
-            .filter(Patient.notif_in_24h == True)
             .update(
                 {Patient.notif_in_24h: False, Patient.daily_survey_triggered_at: None}
             )
         )
+        session.query(DailyCheckin).delete()
+        session.query(GeneratedNotification).delete()
         session.commit()
         return {"status": "success", "updated_count": updated_count}
     except Exception as e:
@@ -215,32 +216,25 @@ def periodic_task():
         session.close()
 
 
-@celery_app.task(name="app.tasks.check_daily_survey_task")
-def check_daily_survey_task():
+@celery_app.task(name="app.tasks.get_momentary_assessment_task")
+def get_momentary_assessment_task():
     """
     Runs every 5 minutes.
 
-    Time-window-driven notification flow:
-      1. Find participants who haven't been notified today (notif_in_24h=False)
-      2. Check that the current time falls within each participant's notification
-         window (time_to_notif from Postgres — single source of truth).
-      3. On first entry into the window, trigger the daily check-in survey via
-         the MORE Gateway and record daily_survey_triggered_at.
-      4. Once check-in data appears in Elasticsearch, generate a personalised
-         notification via LLM using the profile stored in Postgres.
-      5. Send via Firebase, log, trigger message-evaluation, mark notif_in_24h=True.
+    Fetches today's check-ins from LimeSurvey and:
+      - Upserts check-in data to DailyCheckin for participants who responded.
+      - For participants without check-in data: triggers the momentary assessment
+        survey if inside their notification window and not yet triggered today.
     """
     from .lime_fetcher import get_all_todays_checkins_from_lime
-    from .pipelines import generate_notifications_for_patients
 
-    local_now = datetime.utcnow() + SERVER_TZ_OFFSET
+    local_now = datetime.now(timezone.utc).replace(tzinfo=None) + SERVER_TZ_OFFSET
     current_time = local_now.strftime("%H:%M")
     current_day = local_now.strftime("%A").lower()
 
-    # Fetch all of today's check-ins from LimeSurvey in one batch call
     todays_checkins = get_all_todays_checkins_from_lime()
     logger.info(
-        "check_daily_survey_task: %d participant(s) with check-in data today",
+        "get_momentary_assessment_task: %d participant(s) with check-in data today",
         len(todays_checkins),
     )
 
@@ -256,53 +250,101 @@ def check_daily_survey_task():
         )
 
         if not pending:
+            return {"status": "success", "triggered": 0}
+
+        triggered = 0
+        for patient in pending:
+            context_data = todays_checkins.get(patient.more_participant_id)
+
+            if context_data is not None:
+                # Upsert check-in to local DB so send_notifications_task can read it.
+                existing = (
+                    session.query(DailyCheckin)
+                    .filter(DailyCheckin.more_participant_id == patient.more_participant_id)
+                    .first()
+                )
+                if existing:
+                    existing.checkin_data = context_data
+                else:
+                    session.add(DailyCheckin(
+                        more_participant_id=patient.more_participant_id,
+                        checkin_data=context_data,
+                    ))
+            else:
+                # No check-in yet — gate on time window before triggering survey.
+                if patient.time_to_notif:
+                    window = patient.time_to_notif.get(current_day, {})
+                    if not is_time_in_window(
+                        current_time, window.get("start"), window.get("end")
+                    ):
+                        logger.info(
+                            "get_momentary_assessment_task: participant %d outside window on %s at %s",
+                            patient.more_participant_id,
+                            current_day,
+                            current_time,
+                        )
+                        continue
+
+                if patient.daily_survey_triggered_at is None:
+                    trigger_result = _trigger_more_assessment(
+                        [patient.more_participant_id], MOMENTARY_ASSESMENT_TOKEN
+                    )
+                    if trigger_result.get("status") == "success":
+                        patient.daily_survey_triggered_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        triggered += 1
+                        logger.info(
+                            "get_momentary_assessment_task: triggered check-in for participant %d",
+                            patient.more_participant_id,
+                        )
+                    else:
+                        logger.warning(
+                            "get_momentary_assessment_task: failed to trigger check-in for participant %d: %s",
+                            patient.more_participant_id,
+                            trigger_result.get("message"),
+                        )
+                else:
+                    logger.info(
+                        "get_momentary_assessment_task: no check-in yet for participant %d",
+                        patient.more_participant_id,
+                    )
+
+        session.commit()
+        return {"status": "success", "triggered": triggered}
+
+    except Exception as e:
+        session.rollback()
+        logger.error("get_momentary_assessment_task failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@celery_app.task(name="app.tasks.send_notifications_task")
+def send_notifications_task():
+    """
+    Runs every 5 minutes.
+
+    For participants with check-in data in DailyCheckin and notif_in_24h=False:
+      - Reuses stored GeneratedNotification if available (avoids re-calling LLM on retry).
+      - Generates a personalised notification via LLM for new participants.
+      - Sends via studymanager, logs, triggers message-evaluation, marks notif_in_24h=True.
+    """
+    from .pipelines import generate_notifications_for_patients
+
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(DailyCheckin, Patient)
+            .join(Patient, DailyCheckin.more_participant_id == Patient.more_participant_id)
+            .filter(Patient.notif_in_24h == False)
+            .all()
+        )
+
+        if not rows:
             return {"status": "success", "notified": 0}
 
         patient_dicts = []
-        for patient in pending:
-            # Gate on notification time window
-            if patient.time_to_notif:
-                window = patient.time_to_notif.get(current_day, {})
-                if not is_time_in_window(
-                    current_time, window.get("start"), window.get("end")
-                ):
-                    logger.info(
-                        "check_daily_survey_task: participant %d outside window on %s at %s",
-                        patient.more_participant_id,
-                        current_day,
-                        current_time,
-                    )
-                    continue
-
-            # First time entering the window today — trigger the daily check-in survey
-            if patient.daily_survey_triggered_at is None:
-                trigger_result = _trigger_more_assessment(
-                    [patient.more_participant_id], MOMENTARY_ASSESMENT_TOKEN
-                )
-                if trigger_result.get("status") == "success":
-                    patient.daily_survey_triggered_at = datetime.utcnow()
-                    session.commit()
-                    logger.info(
-                        "check_daily_survey_task: triggered daily check-in for participant %d",
-                        patient.more_participant_id,
-                    )
-                else:
-                    logger.warning(
-                        "check_daily_survey_task: failed to trigger check-in for participant %d: %s",
-                        patient.more_participant_id,
-                        trigger_result.get("message"),
-                    )
-                # Survey just triggered — wait for participant to fill it out
-                continue
-
-            context_data = todays_checkins.get(patient.more_participant_id)
-            if context_data is None:
-                logger.info(
-                    "check_daily_survey_task: no check-in yet for participant %d",
-                    patient.more_participant_id,
-                )
-                continue
-
+        for checkin, patient in rows:
             entry = {
                 "id": str(patient.id),
                 "more_participant_id": patient.more_participant_id,
@@ -314,63 +356,105 @@ def check_daily_survey_task():
                 "age": patient.age,
                 "gender": patient.gender,
                 "job_type": patient.job_type,
-                "context_data": context_data,
+                "context_data": checkin.checkin_data,
             }
             logger.info(
-                "check_daily_survey_task: patient_dict for participant %d: %s",
+                "send_notifications_task: patient_dict for participant %d: %s",
                 patient.more_participant_id,
                 entry,
             )
             patient_dicts.append(entry)
 
-        if not patient_dicts:
-            return {"status": "success", "notified": 0}
+        # Split: already generated vs needing LLM call.
+        ready_notifications = []
+        patients_needing_generation = []
+        for pd_entry in patient_dicts:
+            stored = (
+                session.query(GeneratedNotification)
+                .filter(GeneratedNotification.more_participant_id == pd_entry["more_participant_id"])
+                .first()
+            )
+            if stored:
+                logger.info(
+                    "send_notifications_task: reusing stored notification for participant %d (status=%s)",
+                    pd_entry["more_participant_id"],
+                    stored.send_status,
+                )
+                ready_notifications.append({
+                    "patient_id": pd_entry["id"],
+                    "notification_text": stored.notification_text,
+                    "was_personalized": stored.was_personalized,
+                    "group_id": stored.group_id,
+                })
+            else:
+                patients_needing_generation.append(pd_entry)
 
-        # Generate personalised notifications
-        notifications = generate_notifications_for_patients(
-            patients=patient_dicts,
-            context_data=None,
-            include_big5=True,
-        )
+        if patients_needing_generation:
+            new_notifications = generate_notifications_for_patients(
+                patients=patients_needing_generation,
+                context_data=None,
+                include_big5=True,
+            )
+            for notif in new_notifications:
+                pd_match = next(
+                    (p for p in patients_needing_generation if p["id"] == notif["patient_id"]), None
+                )
+                if pd_match:
+                    session.add(GeneratedNotification(
+                        more_participant_id=pd_match["more_participant_id"],
+                        notification_text=notif["notification_text"],
+                        was_personalized=notif.get("was_personalized", False),
+                        group_id=notif.get("group_id"),
+                        send_status="pending",
+                    ))
+            session.commit()
+            ready_notifications.extend(new_notifications)
 
         notified = 0
-        for notif in notifications:
+        for notif in ready_notifications:
             patient_id = notif["patient_id"]
             pd = next((p for p in patient_dicts if p["id"] == patient_id), None)
             more_pid = pd["more_participant_id"] if pd else None
 
             if more_pid is None:
-                logger.warning(
-                    "No more_participant_id for patient %s, skipping", patient_id
-                )
+                logger.warning("No more_participant_id for patient %s, skipping", patient_id)
                 continue
 
-            # Send via studymanager internal endpoint (stores in notification center + FCM)
             send_result = _send_notification_via_backend(
                 participant_id=more_pid,
                 title="Time to Move!",
                 message=notif["notification_text"],
             )
+
+            stored_notif = (
+                session.query(GeneratedNotification)
+                .filter(GeneratedNotification.more_participant_id == more_pid)
+                .first()
+            )
+
             if send_result.get("status") != "success":
                 logger.warning(
                     "Backend notification send failed for participant %d: %s",
                     more_pid,
                     send_result.get("message"),
                 )
+                if stored_notif:
+                    stored_notif.send_status = "failed"
+                session.commit()
                 continue
 
-            log = NotificationLog(
+            if stored_notif:
+                stored_notif.send_status = "sent"
+                stored_notif.sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            session.add(NotificationLog(
                 more_participant_id=more_pid,
                 notification_text=notif["notification_text"],
-                big5_used=notif.get("was_personalized", False)
-                and bool(pd["big5"] if pd else None),
+                big5_used=notif.get("was_personalized", False) and bool(pd["big5"] if pd else None),
                 group_id=notif.get("group_id"),
-            )
-            session.add(log)
+            ))
 
-            patient_obj = (
-                session.query(Patient).filter(Patient.id == patient_id).first()
-            )
+            patient_obj = session.query(Patient).filter(Patient.id == patient_id).first()
             if patient_obj:
                 patient_obj.notif_in_24h = True
                 if patient_obj.more_participant_id:
@@ -385,16 +469,14 @@ def check_daily_survey_task():
                         )
 
             notified += 1
-            logger.info(
-                "Notification sent via backend & logged for participant %d", more_pid
-            )
+            logger.info("Notification sent via backend & logged for participant %d", more_pid)
 
         session.commit()
         return {"status": "success", "notified": notified}
 
     except Exception as e:
         session.rollback()
-        logger.error("check_daily_survey_task failed: %s", e)
+        logger.error("send_notifications_task failed: %s", e)
         return {"status": "error", "message": str(e)}
     finally:
         session.close()
@@ -438,7 +520,6 @@ def fetch_evening_followup_task():
     """
     from .lime_fetcher import get_recent_evening_followups_from_lime
     from .models import EveningFollowupResponse
-    from datetime import datetime, timezone
 
     try:
         records = get_recent_evening_followups_from_lime(since_hours=24)
