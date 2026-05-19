@@ -264,8 +264,7 @@ _CONTEXT_TEMPLATE = (
     '- Open reflection: "{reflection}"\n\n'
     "Generate a single motivational message for this user based on their current situation. "
     "The message should acknowledge their state and encourage them toward their planned activity."
-    "Please have the length of the motivational message reflect the length of user input of planned activity today and open reflection"
-    "Keep it kind of short if user is replying under 10-15 words"
+    "Please have the length of the motivational message reflect the length of user input of planned activity today and open reflection."
 )
 
 

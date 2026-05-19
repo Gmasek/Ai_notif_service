@@ -24,7 +24,7 @@ services:
 
   beat:
     build: .
-    command: celery -A app.celery_app beat -l info
+    command: celery -A app.celery_app beat -l info --pidfile /app/celerybeat.pid
     depends_on:
       db:
         condition: service_healthy
@@ -37,7 +37,7 @@ services:
       - default
       - more_platform
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' > /dev/null"]
+      test: ["CMD-SHELL", "test -f /app/celerybeat.pid && kill -0 $(cat /app/celerybeat.pid) 2>/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
