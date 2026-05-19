@@ -264,8 +264,7 @@ _CONTEXT_TEMPLATE = (
     '- Open reflection: "{reflection}"\n\n'
     "Generate a single motivational message for this user based on their current situation. "
     "The message should acknowledge their state and encourage them toward their planned activity."
-    "Please have the length of the motivational message reflect the length of user input of planned activity today and open reflection."
-)
+    )
 
 
 def build_contextual_information(context_data: dict) -> str:
