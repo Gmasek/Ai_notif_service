@@ -289,7 +289,9 @@ def build_contextual_information(context_data: dict) -> str:
             "calendar entries",
             "motivation_pa",
             "barrier_pa",
+            "plans_pa_today",
             "pa_scheduled_today",
+            "pa_change_reason",
             "pa_performed_today",
             "next_day_text",
             "pa_scheduled_tomorrow",
@@ -335,8 +337,20 @@ def build_contextual_information(context_data: dict) -> str:
     if barrier is not None:
         parts.append(f"Circumstances favouring exercise: {barrier}%.")
 
+    plans_pa = context_data.get("plans_pa_today")
     pa_today = context_data.get("pa_scheduled_today")
-    if pa_today:
+    pa_change_reason = context_data.get("pa_change_reason")
+    if plans_pa == "Y" and pa_today:
+        parts.append(f"Planned physical activity today: {pa_today}.")
+    elif plans_pa == "N":
+        if pa_change_reason:
+            parts.append(
+                f"No physical activity planned today. What changed: {pa_change_reason}."
+            )
+        else:
+            parts.append("No physical activity planned today.")
+    elif pa_today:
+        # Fallback for legacy responses without G01Q04
         parts.append(f"Planned physical activity today: {pa_today}.")
 
     pa_performed = context_data.get("pa_performed_today")
@@ -444,6 +458,17 @@ def prompt_builder(
 
     # ── User message ──────────────────────────────────────────────────────────
     cd = context_data or {}
+    plans_pa = cd.get("plans_pa_today")
+    pa_today = cd.get("pa_scheduled_today")
+    pa_change_reason = cd.get("pa_change_reason")
+    if plans_pa == "N":
+        plan_text = (
+            f"no PA planned today — {pa_change_reason}"
+            if pa_change_reason
+            else "no PA planned today"
+        )
+    else:
+        plan_text = pa_today or "not specified"
     user_message = _CONTEXT_TEMPLATE.format(
         valence=cd.get("mood_valence", "N/A"),
         arousal=cd.get("energetic_arousal", "N/A"),
@@ -451,7 +476,7 @@ def prompt_builder(
         locus=cd.get("locus_of_control", "N/A"),
         motivation=cd.get("motivation_pa", "N/A"),
         barriers=cd.get("barrier_pa", "N/A"),
-        plan=cd.get("pa_scheduled_today") or "not specified",
+        plan=plan_text,
         reflection=cd.get("events_today") or "(none provided)",
     )
 

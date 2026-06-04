@@ -208,7 +208,9 @@ def _parse_checkin(lime_data: dict) -> dict:
         "barrier_pa": _int(lime_data.get("Q00[SQ005]")),
         "stress": _int(lime_data.get("Q00[SQ006]")),
         "events_today": lime_data.get("G01Q02"),
+        "plans_pa_today": lime_data.get("G01Q04"),
         "pa_scheduled_today": lime_data.get("G01Q03"),
+        "pa_change_reason": lime_data.get("G01Q05"),
         "day": datetime.now().strftime("%A"),
         "time": datetime.now().strftime("%H:%M"),
     }
