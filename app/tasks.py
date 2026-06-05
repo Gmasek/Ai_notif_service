@@ -392,7 +392,6 @@ def send_notifications_task():
         if patients_needing_generation:
             new_notifications = generate_notifications_for_patients(
                 patients=patients_needing_generation,
-                context_data=None,
                 include_big5=True,
             )
             for notif in new_notifications:

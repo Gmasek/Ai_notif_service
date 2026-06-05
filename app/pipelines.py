@@ -1,12 +1,19 @@
 from haystack_integrations.components.generators.anthropic import AnthropicChatGenerator
 from haystack.dataclasses import ChatMessage
 from dotenv import load_dotenv
-import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import anthropic as _anthropic
 import json
+import os
 import random
 import logging
+import time
 
 load_dotenv()
+
+LLM_GENERATION_THREADS = int(os.environ.get("LLM_GENERATION_THREADS", "4"))
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "5.0"))
 
 logger = logging.getLogger(__name__)
 
@@ -494,90 +501,97 @@ def prompt_builder(
     return {"system": full_system, "user": user_message}
 
 
-def generate_notifications_for_patients(
-    patients: list, context_data: dict = None, include_big5: bool = False
-):
-    """
-    Generate personalized notifications for a list of patients.
+def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | None:
+    probability = random.randint(1, 10)
+    logger.info("Number generated for personalisation %d", probability)
+    if patient.get("group_id") == 1:
+        was_personalized = probability <= 3
+    elif patient.get("group_id") == 2:
+        was_personalized = probability <= 6
+    else:  # group_id 0
+        was_personalized = probability <= 9
 
-    Args:
-        patients: List of patient dictionaries with their full information
-        context_data: Optional dict with contextual information (day, time, weather, activity, etc.)
-        include_big5: Whether to include Big Five personality traits in the prompt
-
-    Returns:
-        List of generated notifications with patient info
-    """
-    notifications = []
-
-    for patient in patients:
-        # Extract relevant patient context (excluding id, firebase_token, notif_in_24h, time_to_notif, created_at)
-        probability = random.randint(1, 10)
-        logger.info(f"Number generated for personalisation {probability}")
-        if patient.get("group_id") == 1:
-            was_personalized = probability <= 3
-        elif patient.get("group_id") == 2:
-            was_personalized = probability <= 6
-        else:  # groupid 0
-            was_personalized = probability <= 9
-        prompt_parts = prompt_builder(
-            patient=patient,
-            personalized=was_personalized,
-            context_data=patient["context_data"],
-            include_big5=include_big5,
-        )
-        logger.info(
-            "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
-            patient.get("more_participant_id"),
-            patient.get("group_id"),
-            was_personalized,
-        )
-        logger.info(
-            "FULL PROMPT for participant=%s\n--- SYSTEM ---\n%s\n--- USER ---\n%s",
-            patient.get("more_participant_id"),
-            prompt_parts["system"],
-            prompt_parts["user"],
-        )
+    prompt_parts = prompt_builder(
+        patient=patient,
+        personalized=was_personalized,
+        context_data=patient["context_data"],
+        include_big5=include_big5,
+    )
+    logger.info(
+        "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
+        patient.get("more_participant_id"),
+        patient.get("group_id"),
+        was_personalized,
+    )
+    logger.info(
+        "FULL PROMPT for participant=%s\n--- SYSTEM ---\n%s\n--- USER ---\n%s",
+        patient.get("more_participant_id"),
+        prompt_parts["system"],
+        prompt_parts["user"],
+    )
+    pid = patient.get("more_participant_id")
+    notification_text = None
+    messages = [
+        ChatMessage.from_system(prompt_parts["system"]),
+        ChatMessage.from_user(prompt_parts["user"]),
+    ]
+    for attempt in range(LLM_MAX_RETRIES + 1):
         try:
-            messages = [
-                ChatMessage.from_system(prompt_parts["system"]),
-                ChatMessage.from_user(prompt_parts["user"]),
-            ]
             response = anthropic_client.run(messages=messages)
             notification_text = response["replies"][-1].text
-            logger.info(
-                "LLM response for participant %s: %s",
-                patient.get("more_participant_id"),
-                notification_text,
-            )
-        except Exception as e:
-            logger.error(
-                "Anthropic API error for participant %s: %s",
-                patient.get("more_participant_id"),
-                str(e),
-            )
-            notification_text = None
-
-        if notification_text:
-            notifications.append(
-                {
-                    "patient_id": patient.get("id"),
-                    "patient_name": patient.get("name"),
-                    "firebase_token": patient.get("firebase_token"),
-                    "notification_text": notification_text,
-                    "was_personalized": was_personalized,
-                    "group_id": patient.get("group_id"),
-                }
-            )
-            logger.info(
-                "Generated notification for %s: %s",
-                patient.get("name"),
-                notification_text,
-            )
-        else:
+            logger.info("LLM response for participant %s: %s", pid, notification_text)
+            break
+        except _anthropic.RateLimitError as e:
+            if attempt >= LLM_MAX_RETRIES:
+                logger.error(
+                    "Rate limit: giving up after %d attempt(s) for participant %s",
+                    LLM_MAX_RETRIES + 1,
+                    pid,
+                )
+                break
+            # honour Retry-After if Anthropic provides it, otherwise exponential backoff
+            try:
+                delay = float(e.response.headers.get("retry-after") or 0) or (
+                    LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+                )
+            except Exception:
+                delay = LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
             logger.warning(
-                "Skipping notification for %s due to generation failure",
-                patient.get("name"),
+                "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
+                pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
             )
+            time.sleep(delay)
+        except Exception as e:
+            logger.error("Anthropic API error for participant %s: %s", pid, str(e))
+            break
 
+    if notification_text:
+        logger.info("Generated notification for %s: %s", patient.get("name"), notification_text)
+        return {
+            "patient_id": patient.get("id"),
+            "patient_name": patient.get("name"),
+            "firebase_token": patient.get("firebase_token"),
+            "notification_text": notification_text,
+            "was_personalized": was_personalized,
+            "group_id": patient.get("group_id"),
+        }
+    logger.warning("Skipping notification for %s due to generation failure", patient.get("name"))
+    return None
+
+
+def generate_notifications_for_patients(patients: list, include_big5: bool = False):
+    """
+    Generate personalized notifications for a list of patients.
+    LLM calls run in parallel using LLM_GENERATION_THREADS worker threads.
+    """
+    notifications = []
+    with ThreadPoolExecutor(max_workers=LLM_GENERATION_THREADS) as executor:
+        futures = {
+            executor.submit(_generate_for_single_patient, patient, include_big5): patient
+            for patient in patients
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                notifications.append(result)
     return notifications
