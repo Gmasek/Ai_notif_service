@@ -14,11 +14,15 @@ load_dotenv()
 LLM_GENERATION_THREADS = int(os.environ.get("LLM_GENERATION_THREADS", "4"))
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 LLM_RETRY_BASE_DELAY = float(os.environ.get("LLM_RETRY_BASE_DELAY", "5.0"))
+PAST_NOTIF_CONTEXT_N = int(os.environ.get("PAST_NOTIF_CONTEXT_N", "3"))
+VALIDATOR_MODEL = os.environ.get("VALIDATOR_MODEL", "claude-haiku-4-5")
+VALIDATOR_MAX_RETRIES = int(os.environ.get("VALIDATOR_MAX_RETRIES", "2"))
 
 logger = logging.getLogger(__name__)
 
 
 anthropic_client = AnthropicChatGenerator(model="claude-opus-4-7")
+_anthropic_raw = _anthropic.Anthropic()
 
 
 # ── Big Five adjective tables (ported from Prompt_Comparison.py) ──────────────
@@ -273,6 +277,47 @@ _CONTEXT_TEMPLATE = (
     "The message should acknowledge their state and encourage them toward their planned activity."
     )
 
+_PAST_NOTIFICATIONS_TEMPLATE = (
+    "\n\nPrevious motivational messages sent to this user with their survey feedback "
+    "(where feedback is available, use it to understand what they responded well or poorly to "
+    "and adapt your approach accordingly; always avoid repeating similar phrasing or themes):\n{entries}"
+)
+
+_VALIDATOR_PROMPT = (
+    "You are a quality-control assistant for a healthcare motivational app. "
+    "A message has been generated to motivate a user toward physical activity. "
+    "Assess it and reply with ONLY a JSON object — no other text — with two keys:\n"
+    '  "valid": true or false\n'
+    '  "reason": one sentence explanation\n\n'
+    "Mark it INVALID if it:\n"
+    "- Is not a motivational message for physical activity\n"
+    "- Contains harmful, inappropriate, or offensive content\n"
+    "- Is too short (under 20 words) or absurdly long (over 150 words)\n"
+    "- Uses bullet points or numbered lists\n\n"
+    "Otherwise mark it VALID."
+)
+
+
+def _validate_notification(text: str) -> tuple[bool, str]:
+    try:
+        response = _anthropic_raw.messages.create(
+            model=VALIDATOR_MODEL,
+            max_tokens=128,
+            system=_VALIDATOR_PROMPT,
+            messages=[{"role": "user", "content": f'Candidate message:\n"{text}"'}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return bool(data.get("valid", True)), data.get("reason", "")
+    except Exception as e:
+        logger.warning("Validator call failed (%s); treating notification as valid", e)
+        return True, "validator unavailable"
+
 
 def build_contextual_information(context_data: dict) -> str:
     """Build contextual information string from context data, skipping unavailable fields."""
@@ -389,6 +434,7 @@ def prompt_builder(
     personalized: bool,
     context_data: dict = None,
     include_big5: bool = False,
+    past_notifications: list[dict] | None = None,
 ) -> dict:
     """
     Build a prompt dict {"system": ..., "user": ...} for the LLM.
@@ -487,6 +533,18 @@ def prompt_builder(
         reflection=cd.get("events_today") or "(none provided)",
     )
 
+    if past_notifications:
+        lines = []
+        for i, item in enumerate(past_notifications):
+            text = item.get("text", "") if isinstance(item, dict) else item
+            feedback_raw = item.get("feedback_raw") if isinstance(item, dict) else None
+            if feedback_raw:
+                feedback_str = json.dumps(feedback_raw, ensure_ascii=False)
+                lines.append(f"{i + 1}. Message: {text}\n   User feedback: {feedback_str}")
+            else:
+                lines.append(f"{i + 1}. Message: {text}\n   User feedback: (none yet — avoid repeating)")
+        user_message += _PAST_NOTIFICATIONS_TEMPLATE.format(entries="\n".join(lines))
+
     logger.info(
         "prompt_builder [participant=%s] FULL SYSTEM PROMPT:\n%s",
         pid,
@@ -511,11 +569,13 @@ def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | No
     else:  # group_id 0
         was_personalized = probability <= 9
 
+    past_notifications = patient.get("past_notifications") or []
     prompt_parts = prompt_builder(
         patient=patient,
         personalized=was_personalized,
         context_data=patient["context_data"],
         include_big5=include_big5,
+        past_notifications=past_notifications,
     )
     logger.info(
         "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
@@ -530,40 +590,53 @@ def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | No
         prompt_parts["user"],
     )
     pid = patient.get("more_participant_id")
-    notification_text = None
     messages = [
         ChatMessage.from_system(prompt_parts["system"]),
         ChatMessage.from_user(prompt_parts["user"]),
     ]
-    for attempt in range(LLM_MAX_RETRIES + 1):
-        try:
-            response = anthropic_client.run(messages=messages)
-            notification_text = response["replies"][-1].text
-            logger.info("LLM response for participant %s: %s", pid, notification_text)
-            break
-        except _anthropic.RateLimitError as e:
-            if attempt >= LLM_MAX_RETRIES:
-                logger.error(
-                    "Rate limit: giving up after %d attempt(s) for participant %s",
-                    LLM_MAX_RETRIES + 1,
-                    pid,
-                )
-                break
-            # honour Retry-After if Anthropic provides it, otherwise exponential backoff
+
+    notification_text = None
+    for val_attempt in range(VALIDATOR_MAX_RETRIES + 1):
+        candidate = None
+        for attempt in range(LLM_MAX_RETRIES + 1):
             try:
-                delay = float(e.response.headers.get("retry-after") or 0) or (
-                    LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+                response = anthropic_client.run(messages=messages)
+                candidate = response["replies"][-1].text
+                logger.info("LLM response for participant %s: %s", pid, candidate)
+                break
+            except _anthropic.RateLimitError as e:
+                if attempt >= LLM_MAX_RETRIES:
+                    logger.error(
+                        "Rate limit: giving up after %d attempt(s) for participant %s",
+                        LLM_MAX_RETRIES + 1, pid,
+                    )
+                    break
+                try:
+                    delay = float(e.response.headers.get("retry-after") or 0) or (
+                        LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+                    )
+                except Exception:
+                    delay = LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+                logger.warning(
+                    "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
+                    pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
                 )
-            except Exception:
-                delay = LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
-            logger.warning(
-                "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
-                pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
-            )
-            time.sleep(delay)
-        except Exception as e:
-            logger.error("Anthropic API error for participant %s: %s", pid, str(e))
+                time.sleep(delay)
+            except Exception as e:
+                logger.error("Anthropic API error for participant %s: %s", pid, str(e))
+                break
+
+        if not candidate:
             break
+
+        is_valid, reason = _validate_notification(candidate)
+        if is_valid:
+            notification_text = candidate
+            break
+        logger.warning(
+            "Validator rejected notification (attempt %d/%d) for participant %s: %s",
+            val_attempt + 1, VALIDATOR_MAX_RETRIES + 1, pid, reason,
+        )
 
     if notification_text:
         logger.info("Generated notification for %s: %s", patient.get("name"), notification_text)

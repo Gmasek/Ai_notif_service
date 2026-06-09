@@ -66,6 +66,7 @@ class NotificationLog(Base):
     big5_used = Column(Boolean, default=False)
     group_id = Column(Integer, nullable=True)
     sent_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    feedback_raw = Column(JSONB, nullable=True)
 
 
 class DailyCheckin(Base):

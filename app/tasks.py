@@ -12,6 +12,8 @@ from .models import Patient, NotificationLog, DailyCheckin, GeneratedNotificatio
 
 logger = logging.getLogger(__name__)
 
+PAST_NOTIF_CONTEXT_N = int(os.environ.get("PAST_NOTIF_CONTEXT_N", "3"))
+
 MORE_GATEWAY_BASE_URL = os.environ.get(
     "MORE_GATEWAY_BASE_URL", "https://6be5-88-116-37-249.ngrok-free.app"
 )
@@ -345,6 +347,13 @@ def send_notifications_task():
 
         patient_dicts = []
         for checkin, patient in rows:
+            past_logs = (
+                session.query(NotificationLog)
+                .filter(NotificationLog.more_participant_id == patient.more_participant_id)
+                .order_by(NotificationLog.sent_at.desc())
+                .limit(PAST_NOTIF_CONTEXT_N)
+                .all()
+            )
             entry = {
                 "id": str(patient.id),
                 "more_participant_id": patient.more_participant_id,
@@ -357,6 +366,10 @@ def send_notifications_task():
                 "gender": patient.gender,
                 "job_type": patient.job_type,
                 "context_data": checkin.checkin_data,
+                "past_notifications": [
+                    {"text": log.notification_text, "feedback_raw": log.feedback_raw}
+                    for log in past_logs
+                ],
             }
             logger.info(
                 "send_notifications_task: patient_dict for participant %d: %s",
@@ -572,18 +585,65 @@ def fetch_evening_followup_task():
 @celery_app.task(name="app.tasks.fetch_message_eval_task")
 def fetch_message_eval_task():
     """
-    Runs daily at 01:00.
-    Fetches notification message evaluation responses from LimeSurvey.
+    Runs daily every morning.
+    Fetches notification message evaluation responses from LimeSurvey and writes
+    the raw survey data to the most recent unmatched NotificationLog entry for
+    each participant so it can be used as context in future generation.
     """
     from .lime_fetcher import get_recent_message_evals_from_lime
 
     try:
-        records = get_recent_message_evals_from_lime(since_hours=24)
+        records = get_recent_message_evals_from_lime(since_hours=48)
         logger.info("fetch_message_eval_task: %d responses", len(records))
-        return {"status": "success", "count": len(records), "records": records}
     except Exception as e:
         logger.error("fetch_message_eval_task failed: %s", e)
         return {"status": "error", "message": str(e)}
+
+    session = SessionLocal()
+    matched = 0
+    try:
+        for record in records:
+            pid_str = record.get("participant_id") or ""
+            pid = (
+                int(pid_str.replace("participant_", ""))
+                if pid_str.startswith("participant_")
+                else None
+            )
+            if pid is None or not record.get("data"):
+                continue
+
+            log_entry = (
+                session.query(NotificationLog)
+                .filter(
+                    NotificationLog.more_participant_id == pid,
+                    NotificationLog.feedback_raw == None,  # noqa: E711
+                )
+                .order_by(NotificationLog.sent_at.desc())
+                .first()
+            )
+            if log_entry:
+                log_entry.feedback_raw = record["data"]
+                matched += 1
+                logger.info(
+                    "fetch_message_eval_task: matched feedback for participant %d (log id=%s)",
+                    pid,
+                    log_entry.id,
+                )
+            else:
+                logger.info(
+                    "fetch_message_eval_task: no unmatched notification log for participant %d",
+                    pid,
+                )
+
+        session.commit()
+        logger.info("fetch_message_eval_task: %d feedback(s) persisted", matched)
+        return {"status": "success", "fetched": len(records), "matched": matched}
+    except Exception as e:
+        session.rollback()
+        logger.error("fetch_message_eval_task: db write failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
 
 
 @celery_app.task(name="app.tasks.trigger_schedule_update_survey")

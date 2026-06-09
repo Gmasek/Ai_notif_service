@@ -49,7 +49,8 @@ CREATE TABLE notification_logs (
     notification_text    TEXT    NOT NULL,
     big5_used            BOOLEAN DEFAULT FALSE,
     group_id             INTEGER,
-    sent_at              TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    sent_at              TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    feedback_raw         JSONB      -- full survey response from message-eval (NULL = no response yet)
 );
 
 -- Today's check-in data cached from LimeSurvey. One row per participant, cleared at daily reset.
