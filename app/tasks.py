@@ -8,7 +8,9 @@ SERVER_TZ_OFFSET = timedelta(hours=2)
 
 from .celery_app import celery_app
 from .db import SessionLocal
-from .models import Patient, NotificationLog, DailyCheckin, GeneratedNotification
+from .models import (
+    Patient, NotificationLog, DailyCheckin, GeneratedNotification, NotificationExample,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,74 @@ INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "internal-secret-key")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _select_pipeline(session, more_participant_id: int) -> int:
+    """Pick a generation pipeline for this participant, weighted toward an even 1/3
+    split using their own history. Counts past NotificationLog.pipeline values and
+    favours the least-used pipeline (weight proportional to how far it is behind the
+    most-used one), while staying randomised."""
+    from .pipelines import ALL_PIPELINES
+
+    counts = {p: 0 for p in ALL_PIPELINES}
+    rows = (
+        session.query(NotificationLog.pipeline)
+        .filter(
+            NotificationLog.more_participant_id == more_participant_id,
+            NotificationLog.pipeline != None,  # noqa: E711
+        )
+        .all()
+    )
+    for (p,) in rows:
+        if p in counts:
+            counts[p] += 1
+
+    max_count = max(counts.values())
+    # weight ∝ (max - count + 1): under-used pipelines get more weight, ties stay equal.
+    weights = [max_count - counts[p] + 1 for p in ALL_PIPELINES]
+    chosen = random.choices(list(ALL_PIPELINES), weights=weights, k=1)[0]
+    logger.info(
+        "_select_pipeline: participant %d counts=%s weights=%s chosen=%d",
+        more_participant_id, counts, weights, chosen,
+    )
+    return chosen
+
+
+def _snapshot_notification_example(session, pd: dict, notif: dict) -> None:
+    """Write (or refresh) today's NotificationExample row for a participant, capturing the
+    perishable check-in context + generated notification. Idempotent per (participant, day)."""
+    more_pid = pd["more_participant_id"]
+    today = (datetime.now(timezone.utc).replace(tzinfo=None) + SERVER_TZ_OFFSET).date()
+    ctx = pd.get("context_data") or {}
+
+    existing = (
+        session.query(NotificationExample)
+        .filter(
+            NotificationExample.more_participant_id == more_pid,
+            NotificationExample.notif_date == today,
+        )
+        .first()
+    )
+    if existing:
+        return  # one row per participant per day; already snapshotted
+
+    session.add(NotificationExample(
+        more_participant_id=more_pid,
+        notif_date=today,
+        big5=pd.get("big5"),
+        pipeline=notif.get("pipeline"),
+        notification_text=notif["notification_text"],
+        mood_valence=ctx.get("mood_valence"),
+        energetic_arousal=ctx.get("energetic_arousal"),
+        locus_of_control=ctx.get("locus_of_control"),
+        stress=ctx.get("stress"),
+        motivation_pa=ctx.get("motivation_pa"),
+        barrier_pa=ctx.get("barrier_pa"),
+        plans_pa_today=ctx.get("plans_pa_today"),
+        pa_scheduled_today=ctx.get("pa_scheduled_today"),
+        pa_change_reason=ctx.get("pa_change_reason"),
+        events_today=ctx.get("events_today"),
+    ))
 
 
 def is_time_in_window(current_time: str, start_time: str, end_time: str) -> bool:
@@ -358,6 +428,7 @@ def send_notifications_task():
                 "id": str(patient.id),
                 "more_participant_id": patient.more_participant_id,
                 "group_id": patient.group_id,
+                "pipeline": _select_pipeline(session, patient.more_participant_id),
                 "name": patient.name or f"participant_{patient.more_participant_id}",
                 "big5": patient.big5,
                 "hobbies": patient.hobbies,
@@ -396,8 +467,8 @@ def send_notifications_task():
                 ready_notifications.append({
                     "patient_id": pd_entry["id"],
                     "notification_text": stored.notification_text,
-                    "was_personalized": stored.was_personalized,
                     "group_id": stored.group_id,
+                    "pipeline": stored.pipeline,
                 })
             else:
                 patients_needing_generation.append(pd_entry)
@@ -415,8 +486,8 @@ def send_notifications_task():
                     session.add(GeneratedNotification(
                         more_participant_id=pd_match["more_participant_id"],
                         notification_text=notif["notification_text"],
-                        was_personalized=notif.get("was_personalized", False),
                         group_id=notif.get("group_id"),
+                        pipeline=notif.get("pipeline"),
                         send_status="pending",
                     ))
             session.commit()
@@ -462,9 +533,16 @@ def send_notifications_task():
             session.add(NotificationLog(
                 more_participant_id=more_pid,
                 notification_text=notif["notification_text"],
-                big5_used=notif.get("was_personalized", False) and bool(pd["big5"] if pd else None),
+                big5_used=bool(pd["big5"] if pd else None),
                 group_id=notif.get("group_id"),
+                pipeline=notif.get("pipeline"),
             ))
+
+            # Snapshot the example row now, while the perishable check-in context is still
+            # available (DailyCheckin is wiped at the 02:00 reset). Feedback grade + execution
+            # outcome are filled in later by enrich_notification_examples_task.
+            if pd:
+                _snapshot_notification_example(session, pd, notif)
 
             patient_obj = session.query(Patient).filter(Patient.id == patient_id).first()
             if patient_obj:
@@ -641,6 +719,81 @@ def fetch_message_eval_task():
     except Exception as e:
         session.rollback()
         logger.error("fetch_message_eval_task: db write failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@celery_app.task(name="app.tasks.enrich_notification_examples_task")
+def enrich_notification_examples_task():
+    """
+    Runs nightly (~01:30, after message-eval feedback is fetched).
+
+    Fills in the enrichment fields on notification_examples rows snapshotted at send time:
+      - feedback grade/score from the matching NotificationLog.feedback_raw
+      - executed/activity from the matching evening follow-up response
+    Re-processes recent rows so late-arriving feedback backfills without duplication.
+    Only reads persistent tables, so it is independent of the 02:00 daily reset.
+    """
+    from sqlalchemy import func
+    from .pipelines import _classify_feedback, _feedback_score
+    from .models import EveningFollowupResponse
+
+    lookback_start = (
+        datetime.now(timezone.utc).replace(tzinfo=None) + SERVER_TZ_OFFSET
+    ).date() - timedelta(days=4)
+
+    session = SessionLocal()
+    enriched = 0
+    try:
+        rows = (
+            session.query(NotificationExample)
+            .filter(
+                NotificationExample.notif_date >= lookback_start,
+                (NotificationExample.enriched_at == None)  # noqa: E711
+                | (NotificationExample.feedback_grade == None),  # noqa: E711
+            )
+            .all()
+        )
+
+        for ex in rows:
+            log_entry = (
+                session.query(NotificationLog)
+                .filter(
+                    NotificationLog.more_participant_id == ex.more_participant_id,
+                    func.date(NotificationLog.sent_at) == ex.notif_date,
+                    NotificationLog.feedback_raw != None,  # noqa: E711
+                )
+                .order_by(NotificationLog.sent_at.desc())
+                .first()
+            )
+            if log_entry:
+                ex.feedback_raw = log_entry.feedback_raw
+                ex.feedback_grade = _classify_feedback(log_entry.feedback_raw)
+                ex.feedback_score = _feedback_score(log_entry.feedback_raw)
+
+            followup = (
+                session.query(EveningFollowupResponse)
+                .filter(
+                    EveningFollowupResponse.more_participant_id == ex.more_participant_id,
+                    func.date(EveningFollowupResponse.submitdate) == ex.notif_date,
+                )
+                .order_by(EveningFollowupResponse.submitdate.desc())
+                .first()
+            )
+            if followup:
+                ex.executed = followup.exercised
+                ex.execution_activity = followup.activity
+
+            ex.enriched_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            enriched += 1
+
+        session.commit()
+        logger.info("enrich_notification_examples_task: %d example(s) enriched", enriched)
+        return {"status": "success", "enriched": enriched}
+    except Exception as e:
+        session.rollback()
+        logger.error("enrich_notification_examples_task failed: %s", e)
         return {"status": "error", "message": str(e)}
     finally:
         session.close()

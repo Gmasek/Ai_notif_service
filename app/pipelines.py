@@ -18,6 +18,55 @@ PAST_NOTIF_CONTEXT_N = int(os.environ.get("PAST_NOTIF_CONTEXT_N", "3"))
 VALIDATOR_MODEL = os.environ.get("VALIDATOR_MODEL", "claude-haiku-4-5")
 VALIDATOR_MAX_RETRIES = int(os.environ.get("VALIDATOR_MAX_RETRIES", "2"))
 
+# Generation pipelines (stored as ints on notification_logs / generated_notifications).
+PIPELINE_BASIC_CONTEXT = 0
+PIPELINE_RAG = 1
+PIPELINE_AGENTIC = 2
+ALL_PIPELINES = (PIPELINE_BASIC_CONTEXT, PIPELINE_RAG, PIPELINE_AGENTIC)
+PIPELINE_NAMES = {
+    PIPELINE_BASIC_CONTEXT: "basic_context",
+    PIPELINE_RAG: "rag",
+    PIPELINE_AGENTIC: "agentic",
+}
+
+# Feedback grading config. Feedback is graded 1=good / 2=neutral / 3=bad (NULL=no feedback).
+# The exact eval-survey rating field is still being confirmed — keep it env-configurable.
+FEEDBACK_RATING_FIELD = os.environ.get("FEEDBACK_RATING_FIELD", "Q00[SQ004]")
+FEEDBACK_GOOD_MIN = float(os.environ.get("FEEDBACK_GOOD_MIN", "4"))  # >= → grade 1 (good)
+FEEDBACK_BAD_MAX = float(os.environ.get("FEEDBACK_BAD_MAX", "2"))    # <= → grade 3 (bad)
+GRADE_GOOD = 1
+GRADE_NEUTRAL = 2
+GRADE_BAD = 3
+
+# Cross-user retrieval config.
+SIMILAR_PARTICIPANTS_N = int(os.environ.get("SIMILAR_PARTICIPANTS_N", "5"))
+RAG_EXAMPLES_PER_BUCKET = int(os.environ.get("RAG_EXAMPLES_PER_BUCKET", "3"))
+AGENTIC_MAX_TOOL_ITERS = int(os.environ.get("AGENTIC_MAX_TOOL_ITERS", "4"))
+GENERATION_MODEL = os.environ.get("GENERATION_MODEL", "claude-opus-4-7")
+
+# Combined-similarity weights (Big Five distance vs feeling-state distance).
+BIG5_WEIGHT = float(os.environ.get("BIG5_WEIGHT", "1.0"))
+CONTEXT_WEIGHT = float(os.environ.get("CONTEXT_WEIGHT", "1.0"))
+
+# Feeling-state numeric keys (0–100 scales) used for context-similarity matching.
+_CONTEXT_KEYS = (
+    "mood_valence",
+    "energetic_arousal",
+    "locus_of_control",
+    "stress",
+    "motivation_pa",
+    "barrier_pa",
+)
+
+# Big Five trait keys as stored on Patient.big5 (emotional_stability is the inverse of neuroticism).
+_BIG5_KEYS = (
+    "openness",
+    "extraversion",
+    "agreeableness",
+    "conscientiousness",
+    "emotional_stability",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -319,6 +368,203 @@ def _validate_notification(text: str) -> tuple[bool, str]:
         return True, "validator unavailable"
 
 
+# ── Feedback grading & example-store retrieval (rag / agentic pipelines) ────────
+
+_FEEDBACK_EXAMPLES_TEMPLATE = (
+    "\n\n=== EXAMPLES FROM SIMILAR USERS ===\n\n"
+    "Below are past motivational messages sent to users with a similar personality "
+    "profile and a similar feeling-state, with how they were received and whether the "
+    "user actually exercised afterwards. Use them to guide your writing.\n\n"
+    "GOOD — these landed well; emulate their tone, framing, and approach:\n{good}\n\n"
+    "BAD — these landed poorly; avoid these patterns, phrasing, and themes:\n{bad}\n\n"
+    "Do not copy any example verbatim — write a fresh message for the current user's context."
+)
+
+
+def _classify_feedback(feedback_raw: dict | None) -> int | None:
+    """Grade a notification's survey feedback on the 1–3 scale: 1=good, 2=neutral, 3=bad.
+
+    Reads the configurable rating field (FEEDBACK_RATING_FIELD): >= FEEDBACK_GOOD_MIN → 1,
+    <= FEEDBACK_BAD_MAX → 3, in-between → 2. Returns None when feedback is missing or the
+    field is absent/unparseable, so such rows carry no grade.
+    """
+    if not isinstance(feedback_raw, dict):
+        return None
+    value = feedback_raw.get(FEEDBACK_RATING_FIELD)
+    if value is None or value == "":
+        return None
+    try:
+        score = float(value)
+    except (ValueError, TypeError):
+        return None
+    if score >= FEEDBACK_GOOD_MIN:
+        return GRADE_GOOD
+    if score <= FEEDBACK_BAD_MAX:
+        return GRADE_BAD
+    return GRADE_NEUTRAL
+
+
+def _feedback_score(feedback_raw: dict | None) -> float | None:
+    """Extract the raw numeric rating from feedback (for storage), or None."""
+    if not isinstance(feedback_raw, dict):
+        return None
+    value = feedback_raw.get(FEEDBACK_RATING_FIELD)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _big5_distance(a: dict, b: dict) -> float | None:
+    """Euclidean distance between two Big Five profiles. None if either is incomplete."""
+    total = 0.0
+    for key in _BIG5_KEYS:
+        va, vb = a.get(key), b.get(key)
+        if va is None or vb is None:
+            return None
+        total += (float(va) - float(vb)) ** 2
+    return total ** 0.5
+
+
+def _context_distance(a: dict, b: dict) -> float:
+    """Euclidean distance over the feeling-state numerics, each normalized to 0–1 (÷100),
+    averaged over the keys present in both. Returns 0.0 when nothing overlaps."""
+    total = 0.0
+    n = 0
+    for key in _CONTEXT_KEYS:
+        va, vb = a.get(key), b.get(key)
+        if va is None or vb is None:
+            continue
+        total += ((float(va) - float(vb)) / 100.0) ** 2
+        n += 1
+    if n == 0:
+        return 0.0
+    return (total / n) ** 0.5
+
+
+def _combined_distance(big5_a: dict, big5_b: dict, ctx_a: dict, ctx_b: dict) -> float:
+    """Weighted Big Five + feeling-state distance used to rank example rows."""
+    b5 = _big5_distance(big5_a or {}, big5_b or {})
+    b5_term = (b5 / 60.0) if b5 is not None else 0.0
+    ctx_term = _context_distance(ctx_a or {}, ctx_b or {})
+    return BIG5_WEIGHT * b5_term + CONTEXT_WEIGHT * ctx_term
+
+
+def _example_to_record(ex) -> dict:
+    """Project a NotificationExample row into a lightweight dict for prompts/tools."""
+    return {
+        "more_participant_id": ex.more_participant_id,
+        "notification_text": ex.notification_text,
+        "feedback_grade": ex.feedback_grade,
+        "executed": ex.executed,
+        "feeling": {k: getattr(ex, k) for k in _CONTEXT_KEYS},
+        "big5": ex.big5,
+    }
+
+
+def _retrieve_examples(
+    session, big5: dict, context: dict, k_per_grade: int = RAG_EXAMPLES_PER_BUCKET,
+    exclude_pid: int | None = None,
+) -> dict[str, list[dict]]:
+    """Single read of the example store: load graded rows, rank by combined Big Five +
+    feeling-state distance to the current user, and bucket into good (grade 1) / bad
+    (grade 3). Neutral (grade 2) is skipped."""
+    from .models import NotificationExample
+
+    rows = (
+        session.query(NotificationExample)
+        .filter(NotificationExample.feedback_grade != None)  # noqa: E711
+        .all()
+    )
+    scored = []
+    for ex in rows:
+        if exclude_pid is not None and ex.more_participant_id == exclude_pid:
+            continue
+        dist = _combined_distance(big5, ex.big5 or {}, context, _example_to_record(ex)["feeling"])
+        scored.append((dist, ex))
+    scored.sort(key=lambda t: t[0])
+
+    buckets: dict[str, list[dict]] = {"good": [], "bad": []}
+    for _, ex in scored:
+        label = "good" if ex.feedback_grade == GRADE_GOOD else (
+            "bad" if ex.feedback_grade == GRADE_BAD else None
+        )
+        if label and len(buckets[label]) < k_per_grade:
+            buckets[label].append(_example_to_record(ex))
+        if len(buckets["good"]) >= k_per_grade and len(buckets["bad"]) >= k_per_grade:
+            break
+    return buckets
+
+
+def _find_similar_participants(
+    session, big5: dict, context: dict | None, limit: int, exclude_pid: int | None = None
+) -> list[dict]:
+    """Return the `limit` participants whose Big Five (+ optional feeling-state) profile is
+    closest to the current user, as dicts with id + personality + latest feeling snapshot.
+    Used by the agentic find_similar_users tool."""
+    from .models import Patient
+
+    if not big5:
+        return []
+    rows = (
+        session.query(Patient.more_participant_id, Patient.big5)
+        .filter(Patient.big5 != None, Patient.more_participant_id != None)  # noqa: E711
+        .all()
+    )
+    scored = []
+    for pid, other_big5 in rows:
+        if pid == exclude_pid:
+            continue
+        dist = _combined_distance(big5, other_big5 or {}, context or {}, {})
+        scored.append((dist, pid, other_big5))
+    scored.sort(key=lambda t: t[0])
+    return [
+        {"more_participant_id": pid, "big5": b5}
+        for _, pid, b5 in scored[:limit]
+    ]
+
+
+def _get_examples_for_participants(
+    session, participant_ids: list[int], grade: int | None = None
+) -> list[dict]:
+    """Enriched example rows for the given donors, optionally filtered by feedback grade
+    (1=good / 3=bad). Used by the agentic get_user_examples tool."""
+    from .models import NotificationExample
+
+    if not participant_ids:
+        return []
+    q = session.query(NotificationExample).filter(
+        NotificationExample.more_participant_id.in_(participant_ids),
+        NotificationExample.feedback_grade != None,  # noqa: E711
+    )
+    if grade is not None:
+        q = q.filter(NotificationExample.feedback_grade == grade)
+    return [_example_to_record(ex) for ex in q.order_by(NotificationExample.notif_date.desc()).all()]
+
+
+def _format_example_record(rec: dict) -> str:
+    f = rec.get("feeling") or {}
+    feeling = ", ".join(
+        f"{k}={f[k]}" for k in _CONTEXT_KEYS if f.get(k) is not None
+    ) or "n/a"
+    executed = rec.get("executed")
+    exec_str = "exercised" if executed else ("did not exercise" if executed is False else "unknown")
+    return f'- Felt: {feeling}; outcome: {exec_str}\n  Message: "{rec.get("notification_text", "")}"'
+
+
+def _format_examples(buckets: dict[str, list[dict]]) -> str:
+    """Render good/bad enriched example records into the examples prompt block.
+    Returns '' when there is no material to inject."""
+    good, bad = buckets.get("good") or [], buckets.get("bad") or []
+    if not good and not bad:
+        return ""
+    good_str = "\n".join(_format_example_record(r) for r in good) if good else "- (none available)"
+    bad_str = "\n".join(_format_example_record(r) for r in bad) if bad else "- (none available)"
+    return _FEEDBACK_EXAMPLES_TEMPLATE.format(good=good_str, bad=bad_str)
+
+
 def build_contextual_information(context_data: dict) -> str:
     """Build contextual information string from context data, skipping unavailable fields."""
     missing = [
@@ -559,84 +805,303 @@ def prompt_builder(
     return {"system": full_system, "user": user_message}
 
 
-def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | None:
-    probability = random.randint(1, 10)
-    logger.info("Number generated for personalisation %d", probability)
-    if patient.get("group_id") == 1:
-        was_personalized = probability <= 3
-    elif patient.get("group_id") == 2:
-        was_personalized = probability <= 6
-    else:  # group_id 0
-        was_personalized = probability <= 9
+# ── Low-level LLM call helpers (shared rate-limit retry) ───────────────────────
 
-    past_notifications = patient.get("past_notifications") or []
-    prompt_parts = prompt_builder(
-        patient=patient,
-        personalized=was_personalized,
-        context_data=patient["context_data"],
-        include_big5=include_big5,
-        past_notifications=past_notifications,
-    )
-    logger.info(
-        "calling Anthropic for participant=%s group=%s personalized=%s model=claude-opus-4-7",
-        patient.get("more_participant_id"),
-        patient.get("group_id"),
-        was_personalized,
-    )
+def _retry_delay(e, attempt: int) -> float:
+    try:
+        return float(e.response.headers.get("retry-after") or 0) or (
+            LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+        )
+    except Exception:
+        return LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
+
+
+def _run_haystack(messages, pid) -> str | None:
+    """One generation via the Haystack Anthropic client with rate-limit retry."""
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            response = anthropic_client.run(messages=messages)
+            candidate = response["replies"][-1].text
+            logger.info("LLM response for participant %s: %s", pid, candidate)
+            return candidate
+        except _anthropic.RateLimitError as e:
+            if attempt >= LLM_MAX_RETRIES:
+                logger.error(
+                    "Rate limit: giving up after %d attempt(s) for participant %s",
+                    LLM_MAX_RETRIES + 1, pid,
+                )
+                return None
+            delay = _retry_delay(e, attempt)
+            logger.warning(
+                "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
+                pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
+            )
+            time.sleep(delay)
+        except Exception as e:
+            logger.error("Anthropic API error for participant %s: %s", pid, str(e))
+            return None
+    return None
+
+
+def _raw_messages_create(pid=None, **kwargs):
+    """Raw Anthropic messages.create with rate-limit retry (used by the agentic loop)."""
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            return _anthropic_raw.messages.create(**kwargs)
+        except _anthropic.RateLimitError as e:
+            if attempt >= LLM_MAX_RETRIES:
+                logger.error(
+                    "Rate limit: giving up after %d attempt(s) for participant %s",
+                    LLM_MAX_RETRIES + 1, pid,
+                )
+                return None
+            delay = _retry_delay(e, attempt)
+            logger.warning(
+                "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
+                pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
+            )
+            time.sleep(delay)
+        except Exception as e:
+            logger.error("Anthropic API error for participant %s: %s", pid, str(e))
+            return None
+    return None
+
+
+def _log_prompt(pid, system: str, user: str) -> None:
     logger.info(
         "FULL PROMPT for participant=%s\n--- SYSTEM ---\n%s\n--- USER ---\n%s",
-        patient.get("more_participant_id"),
-        prompt_parts["system"],
-        prompt_parts["user"],
+        pid, system, user,
     )
-    pid = patient.get("more_participant_id")
-    messages = [
-        ChatMessage.from_system(prompt_parts["system"]),
-        ChatMessage.from_user(prompt_parts["user"]),
-    ]
 
-    notification_text = None
+
+def _generate_with_validation(generate_fn, pid) -> str | None:
+    """Run generate_fn up to VALIDATOR_MAX_RETRIES+1 times (3 by default), returning
+    the first candidate that passes the Haiku validator."""
     for val_attempt in range(VALIDATOR_MAX_RETRIES + 1):
-        candidate = None
-        for attempt in range(LLM_MAX_RETRIES + 1):
-            try:
-                response = anthropic_client.run(messages=messages)
-                candidate = response["replies"][-1].text
-                logger.info("LLM response for participant %s: %s", pid, candidate)
-                break
-            except _anthropic.RateLimitError as e:
-                if attempt >= LLM_MAX_RETRIES:
-                    logger.error(
-                        "Rate limit: giving up after %d attempt(s) for participant %s",
-                        LLM_MAX_RETRIES + 1, pid,
-                    )
-                    break
-                try:
-                    delay = float(e.response.headers.get("retry-after") or 0) or (
-                        LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
-                    )
-                except Exception:
-                    delay = LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.random()
-                logger.warning(
-                    "Rate limit hit for participant %s (attempt %d/%d), retrying in %.1fs",
-                    pid, attempt + 1, LLM_MAX_RETRIES + 1, delay,
-                )
-                time.sleep(delay)
-            except Exception as e:
-                logger.error("Anthropic API error for participant %s: %s", pid, str(e))
-                break
-
+        candidate = generate_fn()
         if not candidate:
             break
-
         is_valid, reason = _validate_notification(candidate)
         if is_valid:
-            notification_text = candidate
-            break
+            return candidate
         logger.warning(
             "Validator rejected notification (attempt %d/%d) for participant %s: %s",
             val_attempt + 1, VALIDATOR_MAX_RETRIES + 1, pid, reason,
         )
+    return None
+
+
+# ── Pipeline builders — each returns a zero-arg generate_fn callable ────────────
+# Personalization (Big Five injection) is always on for every pipeline.
+
+def _pipeline_basic_context(patient: dict, include_big5: bool):
+    """Context + Big Five personality only; no examples."""
+    pid = patient.get("more_participant_id")
+    prompt_parts = prompt_builder(
+        patient=patient,
+        personalized=True,
+        context_data=patient["context_data"],
+        include_big5=include_big5,
+        past_notifications=None,
+    )
+    messages = [
+        ChatMessage.from_system(prompt_parts["system"]),
+        ChatMessage.from_user(prompt_parts["user"]),
+    ]
+    _log_prompt(pid, prompt_parts["system"], prompt_parts["user"])
+    return lambda: _run_haystack(messages, pid)
+
+
+def _pipeline_rag(patient: dict, include_big5: bool):
+    """Deterministic retrieval: one read of the example store, injecting good/bad
+    examples from users similar in Big Five + feeling-state."""
+    pid = patient.get("more_participant_id")
+    context = patient.get("context_data") or {}
+    from .db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        buckets = _retrieve_examples(
+            session, patient.get("big5") or {}, context,
+            RAG_EXAMPLES_PER_BUCKET, exclude_pid=pid,
+        )
+    finally:
+        session.close()
+
+    examples_block = _format_examples(buckets)
+    logger.info(
+        "rag pipeline participant=%s good=%d bad=%d",
+        pid, len(buckets["good"]), len(buckets["bad"]),
+    )
+    prompt_parts = prompt_builder(
+        patient=patient,
+        personalized=True,
+        context_data=context,
+        include_big5=include_big5,
+        past_notifications=None,
+    )
+    system = prompt_parts["system"]
+    user = prompt_parts["user"] + examples_block
+    messages = [ChatMessage.from_system(system), ChatMessage.from_user(user)]
+    _log_prompt(pid, system, user)
+    return lambda: _run_haystack(messages, pid)
+
+
+_AGENTIC_TOOLS = [
+    {
+        "name": "find_similar_users",
+        "description": (
+            "Find users whose Big Five personality (and feeling-state) is most similar to "
+            "the current user. Returns participant IDs and their personality profile; pass "
+            "the IDs to get_user_examples."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "How many similar users to return (default 5).",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_user_examples",
+        "description": (
+            "Fetch past notifications sent to the given users, each with the user's "
+            "feeling-state at the time, how they graded it, and whether they exercised "
+            "afterwards. Optionally filter by grade (1=good, 3=bad)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "participant_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                },
+                "grade": {
+                    "type": "integer",
+                    "description": "Optional grade filter: 1 for good examples, 3 for bad.",
+                },
+            },
+            "required": ["participant_ids"],
+        },
+    },
+]
+
+_AGENTIC_SYSTEM_SUFFIX = (
+    "\n\n=== RETRIEVAL TOOLS ===\n"
+    "You have tools to learn from how similar users responded to past messages. "
+    "Before writing, call find_similar_users to identify users with a similar "
+    "personality and feeling-state, then get_user_examples to see which messages they "
+    "graded good (1) or bad (3) and whether they ended up exercising. Emulate what "
+    "worked and steer clear of what did not. Once you have gathered what you need, reply "
+    "with ONLY the final motivational message — no tool talk, no preamble, no explanation."
+)
+
+
+def _execute_agentic_tool(name: str, tool_input: dict, big5: dict, context: dict, pid) -> dict:
+    from .db import SessionLocal
+
+    session = SessionLocal()
+    try:
+        if name == "find_similar_users":
+            limit = int(tool_input.get("limit") or SIMILAR_PARTICIPANTS_N)
+            return {
+                "users": _find_similar_participants(
+                    session, big5, context, limit, exclude_pid=pid
+                )
+            }
+        if name == "get_user_examples":
+            pids = [int(p) for p in (tool_input.get("participant_ids") or [])]
+            grade = tool_input.get("grade")
+            grade = int(grade) if grade is not None else None
+            return {"examples": _get_examples_for_participants(session, pids, grade)}
+        return {"error": f"unknown tool {name}"}
+    except Exception as e:
+        logger.error("agentic tool %s failed for participant %s: %s", name, pid, e)
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+def _run_agentic_loop(system: str, user: str, big5: dict, context: dict, pid) -> str | None:
+    messages = [{"role": "user", "content": user}]
+    for _ in range(AGENTIC_MAX_TOOL_ITERS):
+        resp = _raw_messages_create(
+            pid=pid,
+            model=GENERATION_MODEL,
+            max_tokens=1024,
+            system=system,
+            tools=_AGENTIC_TOOLS,
+            messages=messages,
+        )
+        if resp is None:
+            return None
+        if resp.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use":
+                    result = _execute_agentic_tool(block.name, block.input, big5, context, pid)
+                    logger.info(
+                        "agentic tool call participant=%s tool=%s input=%s -> %s",
+                        pid, block.name, block.input, result,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result, ensure_ascii=False, default=str),
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+        text = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+        logger.info("agentic LLM response for participant %s: %s", pid, text)
+        return text or None
+    logger.warning("agentic loop hit max tool iterations for participant %s", pid)
+    return None
+
+
+def _pipeline_agentic(patient: dict, include_big5: bool):
+    """Tool-use loop: Opus fetches similar users' graded examples from the store itself."""
+    pid = patient.get("more_participant_id")
+    big5 = patient.get("big5") or {}
+    context = patient.get("context_data") or {}
+    prompt_parts = prompt_builder(
+        patient=patient,
+        personalized=True,
+        context_data=context,
+        include_big5=include_big5,
+        past_notifications=None,
+    )
+    system = prompt_parts["system"] + _AGENTIC_SYSTEM_SUFFIX
+    user = prompt_parts["user"]
+    _log_prompt(pid, system, user)
+    return lambda: _run_agentic_loop(system, user, big5, context, pid)
+
+
+_PIPELINE_BUILDERS = {
+    PIPELINE_BASIC_CONTEXT: _pipeline_basic_context,
+    PIPELINE_RAG: _pipeline_rag,
+    PIPELINE_AGENTIC: _pipeline_agentic,
+}
+
+
+def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | None:
+    pid = patient.get("more_participant_id")
+    pipeline = patient.get("pipeline")
+    if pipeline not in _PIPELINE_BUILDERS:
+        pipeline = PIPELINE_BASIC_CONTEXT
+    logger.info(
+        "calling Anthropic for participant=%s group=%s pipeline=%s model=%s",
+        pid, patient.get("group_id"), PIPELINE_NAMES.get(pipeline), GENERATION_MODEL,
+    )
+
+    generate_fn = _PIPELINE_BUILDERS[pipeline](patient, include_big5)
+    notification_text = _generate_with_validation(generate_fn, pid)
 
     if notification_text:
         logger.info("Generated notification for %s: %s", patient.get("name"), notification_text)
@@ -645,8 +1110,8 @@ def _generate_for_single_patient(patient: dict, include_big5: bool) -> dict | No
             "patient_name": patient.get("name"),
             "firebase_token": patient.get("firebase_token"),
             "notification_text": notification_text,
-            "was_personalized": was_personalized,
             "group_id": patient.get("group_id"),
+            "pipeline": pipeline,
         }
     logger.warning("Skipping notification for %s due to generation failure", patient.get("name"))
     return None

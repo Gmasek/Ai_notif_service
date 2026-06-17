@@ -52,6 +52,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.fetch_message_eval_task",
         "schedule": crontab(hour=1, minute=0),
     },
+    # Nightly: enrich notification_examples with feedback grade + execution outcome
+    "enrich-notification-examples-nightly": {
+        "task": "app.tasks.enrich_notification_examples_task",
+        "schedule": crontab(hour=1, minute=30),
+    },
     # Every Sunday morning: trigger PA schedule update survey for all participants
     "trigger-schedule-update-survey-sunday-morning": {
         "task": "app.tasks.trigger_schedule_update_survey",
