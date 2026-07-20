@@ -5,6 +5,9 @@ participants. Participant profiles, daily check-ins and survey feedback come fro
 **LimeSurvey**; messages are generated with **Claude** and delivered through the MORE
 studymanager backend.
 
+This application has to be deployed next to an instance of MORE platform, sharing a network. 
+https://github.com/MORE-Platform
+
 There is **no HTTP API** — the whole system is a set of scheduled Celery tasks.
 
 ## How it works
