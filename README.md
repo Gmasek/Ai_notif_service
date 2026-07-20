@@ -1,274 +1,184 @@
 # AI Notification Prototype
 
-This project is a health and wellness notification system that generates personalized notifications for users based on their profiles and schedules.
+Generates personalized physical-activity motivational notifications for MORE study
+participants. Participant profiles, daily check-ins and survey responses come from
+**LimeSurvey**; messages are generated with **Claude** and delivered through the MORE
+studymanager backend.
 
-## Features
+There is **no HTTP API** — the whole system is a set of scheduled Celery tasks.
 
-- Scheduled notifications based on user time windows
-- Personalized notification generation using OpenAI
-- Big Five personality traits and Theory of Planned Behavior integration
-- Celery-based task scheduling
-- PostgreSQL database with JSONB support
+## How it works
+
+```
+LimeSurvey ──► profiles / check-ins / survey responses
+                    │
+                    ▼
+        ┌───────────────────────────┐
+        │  Celery beat + worker      │
+        │  (scheduled tasks)         │
+        └───────────────────────────┘
+                    │
+        generate with Claude ──► send via studymanager ──► trigger feedback survey
+```
+
+Daily cycle for a participant:
+
+1. **`periodic_task`** — scans the LimeSurvey baseline survey and upserts `patients`
+   (Big Five, TPB, demographics, notification schedule). Participants are assigned an
+   A/B group (`group_id = participant_id % 3`).
+2. **`get_momentary_assessment_task`** — pulls today's check-in into `daily_checkins`;
+   if there is none and the participant is inside their notification window, triggers the
+   momentary-assessment survey via the MORE Gateway.
+3. **`send_notifications_task`** — for participants with a check-in who haven't been
+   notified today: generates the message with Claude, sends it via the studymanager
+   internal endpoint, writes `notification_logs`, marks `notif_in_24h`, and triggers the
+   message-evaluation survey. Generated text is persisted to `generated_notifications`
+   first, so a failed send is retried without re-calling the LLM.
+4. **`trigger_evening_followup_task`** / **`fetch_evening_followup_task`** — the evening
+   "did you exercise?" survey, stored in `evening_followup_responses`.
+5. **`fetch_message_eval_task`** — fetches message-evaluation responses from LimeSurvey
+   and logs them. *(Currently fetch-only — the responses are returned by the task but not
+   persisted to the database.)*
+6. **`reset_notification_flags`** — clears daily state (`daily_checkins`,
+   `generated_notifications`, `notif_in_24h`).
+
+Weekly, **`trigger_schedule_update_survey`** and **`update_schedule_fields_task`** refresh
+each participant's `time_to_notif` notification windows from the PA-schedule survey.
+
+## Message generation
+
+Prompts are assembled in [`app/pipelines.py`](app/pipelines.py) from two parts:
+
+- **Context** — the check-in numerics (affective valence, energetic arousal, stress, locus
+  of control, motivation, barriers) plus the planned activity and open reflection.
+- **Personality** (conditional) — the participant's Big Five scores rendered as a full
+  spectrum of adjective descriptors, injected with instructions to adapt tone, framing and
+  emotional register *invisibly*.
+
+**Personalization is the A/B variable.** For each notification a number 1–10 is drawn and
+compared against a per-group threshold, so personality injection happens with a different
+probability per group:
+
+| `group_id` | Chance the message is personalized |
+|------------|-----------------------------------|
+| 1 | 30% |
+| 2 | 60% |
+| 0 | 90% |
+
+Whether personality was actually used is recorded on each row
+(`generated_notifications.was_personalized`, `notification_logs.big5_used`) so outcomes can
+be compared across groups.
+
+Generation runs in parallel across participants (`LLM_GENERATION_THREADS` worker threads)
+with exponential-backoff retry on rate limits.
+
+## Schedule
+
+Celery beat runs in **UTC** (application logic offsets by `SERVER_TZ_OFFSET`, +2h).
+
+| Task | Schedule |
+|------|----------|
+| `periodic_task` | every 150 s |
+| `get_momentary_assessment_task` | every 150 s |
+| `send_notifications_task` | every 150 s |
+| `trigger_evening_followup_task` | 17:30 daily |
+| `fetch_evening_followup_task` | 21:15 daily |
+| `fetch_message_eval_task` | 01:00 daily |
+| `reset_notification_flags` | 02:00 daily |
+| `trigger_schedule_update_survey` | Sunday 07:00 |
+| `update_schedule_fields_task` | Sunday 21:59 |
+
+> Note: several task docstrings say "every 15 minutes"; the configured interval is
+> actually 150 seconds.
+
+## Database
+
+Schema lives in [`db/init.sql`](db/init.sql) (applied automatically on a fresh Postgres
+volume — there is no migration framework, so schema changes to a live DB need manual DDL).
+
+| Table | Purpose |
+|-------|---------|
+| `patients` | Participant profile (Big Five, TPB, demographics, schedule) + notification state |
+| `daily_checkins` | Today's check-in (cleared at daily reset) |
+| `generated_notifications` | Today's generated text + send status, so retries don't re-call the LLM (cleared at reset) |
+| `notification_logs` | Every sent notification, with group and whether Big Five was used |
+| `evening_followup_responses` | "Did you exercise?" survey responses |
 
 ## Setup
 
-### 1. Firebase Configuration (Required for push notifications)
+### 1. Configure environment
 
-To enable Firebase Cloud Messaging for push notifications:
-
-1. Go to the [Firebase Console](https://console.firebase.google.com/)
-2. Select your project (or create a new one)
-3. Go to Project Settings > Service Accounts
-4. Click "Generate New Private Key" to download your service account JSON file
-5. Rename it to `firebase-service-account.json` and place it in the project root directory
-
-The file should look like this (use the example file as reference):
 ```bash
-cp firebase-service-account.example.json firebase-service-account.json
-# Edit firebase-service-account.json with your actual credentials
+cp .env.example .env.local
+# fill in ANTHROPIC_API_KEY, LimeSurvey credentials/survey IDs, MORE Gateway tokens
 ```
-
-**Note:** If the `firebase-service-account.json` file is not present, the system will still work but push notifications will be disabled. Check logs for warnings.
 
 ### 2. Start the services
 
 ```bash
-docker-compose up --build
+docker compose up --build -d
 ```
 
-### 3. Access the API
+Services: **worker** (Celery worker), **beat** (Celery scheduler), **db** (Postgres 16).
 
-The API will be available at `http://localhost:8000`
+Two local-run caveats:
 
-## API Endpoints
+- The Celery broker is `redis://redis:6379/0`, but **no `redis` service is defined in
+  `docker-compose.yml`** — it is expected on the external network. Without it the worker
+  logs connection errors and eventually exits. Add a `redis` service (or run one on the
+  network) for a fully standalone local stack.
+- `docker-compose.yml` joins the external network `traefik_default`. If it doesn't exist
+  locally: `docker network create traefik_default`.
 
-### Create Patient
-
-**Endpoint:** `POST http://localhost:8000/db_fill`
-
-**Description:** Creates a new patient record in the database with their profile information and notification schedule.
-
-**Request Body:**
-
-```json
-{
-  "name": "John Doe",
-  "time_to_notif": {
-    "monday": { "start": "15:00", "end": "17:00" },
-    "tuesday": { "start": "10:00", "end": "18:00" },
-    "wednesday": { "start": "09:30", "end": "17:30" },
-    "thursday": { "start": "08:00", "end": "16:00" },
-    "friday": { "start": "09:00", "end": "15:00" },
-    "saturday": { "start": "10:00", "end": "14:00" },
-    "sunday": { "start": "11:00", "end": "13:00" }
-  },
-  "firebase_token": "fcm_token_example_1234567890",
-  "big5": {
-    "openness": 0.8,
-    "conscientiousness": 0.6,
-    "extraversion": 0.7,
-    "agreeableness": 0.9,
-    "neuroticism": 0.3
-  },
-  "hobbies": ["reading", "cycling", "painting"],
-  "tpb": {
-    "attitude": 0.75,
-    "subjective_norm": 0.6,
-    "perceived_behavioral_control": 0.8,
-    "intention": 0.7
-  },
-  "group_id": 2,
-  "age": 28,
-  "gender": "male",
-  "job_type": "software engineer"
-}
-```
-
-**Field Descriptions:**
-
-- `name` (required): Patient's full name
-- `time_to_notif` (optional): Notification time windows for each day of the week (use lowercase day names)
-  - Each day has a `start` and `end` time in HH:MM format (24-hour)
-- `firebase_token` (optional): Firebase Cloud Messaging token for push notifications
-- `big5` (optional): Big Five personality trait scores (values between 0 and 1)
-  - `openness`: Openness to experience
-  - `conscientiousness`: Conscientiousness
-  - `extraversion`: Extraversion
-  - `agreeableness`: Agreeableness
-  - `neuroticism`: Neuroticism
-- `hobbies` (optional): Array of hobby strings
-- `tpb` (optional): Theory of Planned Behavior scores (values between 0 and 1)
-  - `attitude`: Attitude toward the behavior
-  - `subjective_norm`: Perceived social pressure
-  - `perceived_behavioral_control`: Perceived ease/difficulty
-  - `intention`: Intention to perform the behavior
-- `group_id` (optional): Group identifier for experiments
-- `age` (optional): Patient's age (must be >= 0)
-- `gender` (optional): Gender identifier
-- `job_type` (optional): Job or occupation type
-
-**Example using cURL:**
+### 3. Reset the database
 
 ```bash
-curl -X POST http://localhost:8000/db_fill \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "John Doe",
-    "time_to_notif": {
-      "monday": { "start": "15:00", "end": "17:00" },
-      "tuesday": { "start": "10:00", "end": "18:00" }
-    },
-    "age": 28,
-    "gender": "male",
-    "job_type": "software engineer"
-  }'
+docker compose down -v && docker compose up --build -d
 ```
 
----
+## Configuration
 
-### Update Firebase Token
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ANTHROPIC_API_KEY` | — | Claude API key (required) |
+| `LLM_GENERATION_THREADS` | `4` | Parallel generation worker threads |
+| `LLM_MAX_RETRIES` | `3` | Rate-limit retry attempts |
+| `LLM_RETRY_BASE_DELAY` | `5.0` | Backoff base (seconds) |
+| `DATABASE_URL` | — | Postgres connection string |
+| `MORE_GATEWAY_BASE_URL` | — | MORE Gateway base URL for survey triggers |
+| `MOMENTARY_ASSESMENT_TOKEN` | — | Triggers the daily check-in survey |
+| `NOTIFACTION_FEEDBACK_TOKEN` | — | Triggers the message-evaluation survey |
+| `PA_SCHEDULE_UPDATE_TOKEN` | — | Triggers the weekly PA-schedule survey |
+| `EVENING_FOLLOW_UP_TOKEN` | — | Triggers the evening follow-up survey |
+| `MORE_STUDYMANAGER_BASE_URL` | `http://host.docker.internal:8080` | Notification delivery endpoint |
+| `MORE_STUDY_ID` | `4` | Study ID used when sending notifications |
+| `INTERNAL_API_KEY` | — | API key for the studymanager internal endpoint |
+| `LIME_REMOTE_URL` | — | LimeSurvey RemoteControl API URL |
+| `LIME_ADMIN_USER` / `LIME_ADMIN_PWD` | — | LimeSurvey credentials |
+| `LIME_*_SURVEY_ID` | — | Baseline, daily check-in, PA schedule, evening follow-up and message-eval survey IDs |
 
-**Endpoint:** `POST http://localhost:8000/update_firebase_token`
+The generation model is currently hard-coded to `claude-opus-4-7` in
+[`app/pipelines.py`](app/pipelines.py).
 
-**Description:** Updates the Firebase token for an existing patient. This is useful when a user logs in from a new device or when their Firebase token is refreshed.
+## Running tasks manually
 
-**Request Body:**
-
-```json
-{
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "firebase_token": "new_fcm_token_example_0987654321"
-}
-```
-
-**Field Descriptions:**
-
-- `user_id` (required): The UUID of the patient to update
-- `firebase_token` (required): The new Firebase Cloud Messaging token
-
-**Response:**
-
-```json
-{
-  "task_id": "abc123-def456-ghi789",
-  "status": "submitted"
-}
-```
-
-**Example using cURL:**
+Tasks can be invoked directly inside the worker container, which is the quickest way to
+exercise a step without waiting for the scheduler:
 
 ```bash
-curl -X POST http://localhost:8000/update_firebase_token \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "550e8400-e29b-41d4-a716-446655440000",
-    "firebase_token": "new_fcm_token_example_0987654321"
-  }'
+docker compose exec worker python -c \
+  "from app.tasks import periodic_task; print(periodic_task())"
+
+docker compose exec worker python -c \
+  "from app.tasks import send_notifications_task; print(send_notifications_task())"
 ```
-
-**Check Task Result:**
-
-To check if the update completed successfully:
-
-```bash
-curl http://localhost:8000/result/{task_id}
-```
-
-Example response when complete:
-
-```json
-{
-  "status": "done",
-  "result": {
-    "status": "success",
-    "message": "Firebase token updated for patient John Doe",
-    "patient_id": "550e8400-e29b-41d4-a716-446655440000",
-    "patient_name": "John Doe",
-    "firebase_token": "new_fcm_token_example_0987654321"
-  }
-}
-```
-
----
-
-### Get Task Result
-
-**Endpoint:** `GET http://localhost:8000/result/{task_id}`
-
-**Description:** Check the status and result of any asynchronous task (database fill or Firebase token update).
-
-**Response (Pending):**
-
-```json
-{
-  "status": "pending"
-}
-```
-
-**Response (Complete):**
-
-```json
-{
-  "status": "done",
-  "result": { /* task-specific result data */ }
-}
-```
-
-## How It Works
-
-### Notification System
-
-1. **Celery Beat Scheduler**: Runs a periodic task every 100 seconds (configurable)
-2. **Patient Matching**: Finds patients whose notification time window includes the current time
-3. **Notification Generation**: Uses OpenAI to create personalized notifications based on patient profiles
-4. **Firebase Push Notifications**: Sends generated notifications via Firebase Cloud Messaging
-5. **Notification Tracking**: Marks patients as notified to prevent duplicate notifications within 24 hours
-6. **Midnight Reset**: Resets all notification flags daily at midnight
-
-### Firebase Cloud Messaging Flow
-
-When the periodic task runs:
-1. Matches patients whose time window includes the current time
-2. Generates personalized notification text using OpenAI based on patient profile
-3. Sends push notifications via Firebase Cloud Messaging to each patient's device
-4. Marks patients as notified to prevent duplicates
-
-**Firebase Features:**
-- Async batch notification sending for better performance
-- Automatic retry handling for failed notifications
-- Token validation and error handling
-- Detailed logging of success/failure rates
-
-### Time Window Matching
-
-The system checks if the current time falls within a patient's notification window:
-- Day names must be lowercase (monday, tuesday, etc.)
-- Time format: HH:MM (24-hour format)
-- A patient matches if: `start_time <= current_time <= end_time`
-
-## Database Reset
-
-If you need to reset the database (e.g., after schema changes):
-
-```bash
-docker-compose down -v
-docker-compose up --build
-```
-
-## Services
-
-- **API**: FastAPI application (port 8000)
-- **Worker**: Celery worker for task execution
-- **Beat**: Celery beat scheduler for periodic tasks
-- **PostgreSQL**: Database (port 5432)
-- **Redis**: Message broker for Celery (port 6379)
 
 ## Logs
 
-View logs for specific services:
-
 ```bash
-docker-compose logs -f worker
-docker-compose logs -f beat
-docker-compose logs -f api
+docker compose logs -f worker
+docker compose logs -f beat
 ```
+
+Generation logs the full system prompt and user message per participant at INFO level,
+which is the fastest way to see exactly what was sent to the model.
