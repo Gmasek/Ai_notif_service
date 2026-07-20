@@ -3,7 +3,10 @@
 Generates personalized physical-activity motivational notifications for MORE study
 participants. Participant profiles, daily check-ins and survey responses come from
 **LimeSurvey**; messages are generated with **Claude** and delivered through the MORE
-studymanager backend.
+studymanager backend. 
+
+This application has to be deployed next to an instance of MORE platform, and share a network.
+https://github.com/MORE-Platform
 
 There is **no HTTP API** — the whole system is a set of scheduled Celery tasks.
 
@@ -151,7 +154,7 @@ docker compose down -v && docker compose up --build -d
 | `PA_SCHEDULE_UPDATE_TOKEN` | — | Triggers the weekly PA-schedule survey |
 | `EVENING_FOLLOW_UP_TOKEN` | — | Triggers the evening follow-up survey |
 | `MORE_STUDYMANAGER_BASE_URL` | `http://host.docker.internal:8080` | Notification delivery endpoint |
-| `MORE_STUDY_ID` | `4` | Study ID used when sending notifications |
+| `MORE_STUDY_ID` | - | Study ID used when sending notifications |
 | `INTERNAL_API_KEY` | — | API key for the studymanager internal endpoint |
 | `LIME_REMOTE_URL` | — | LimeSurvey RemoteControl API URL |
 | `LIME_ADMIN_USER` / `LIME_ADMIN_PWD` | — | LimeSurvey credentials |
