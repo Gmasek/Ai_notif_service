@@ -23,6 +23,7 @@ CREATE TABLE patients (
 
     notif_in_24h                BOOLEAN   DEFAULT FALSE,    -- notification already sent today
     daily_survey_triggered_at   TIMESTAMP WITH TIME ZONE,   -- when daily check-in was last triggered
+    evening_followup_triggered_at TIMESTAMP WITH TIME ZONE,   -- when evening follow-up was last triggered
 
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

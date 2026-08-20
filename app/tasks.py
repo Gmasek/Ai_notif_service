@@ -34,6 +34,8 @@ MORE_STUDYMANAGER_BASE_URL = os.environ.get(
 )
 MORE_STUDY_ID = int(os.environ.get("MORE_STUDY_ID", "4"))
 INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "internal-secret-key")
+LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ_NAME", "Europe/Vienna")
+LATE_FOLLOWUP_CUTOFF = os.environ.get("LATE_FOLLOWUP_CUTOFF", "19:30")
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +181,18 @@ def _trigger_more_assessment(participant_ids: list, more_token: str) -> dict:
         return {"status": "error", "message": str(exc)}
 
 
+def _mark_evening_followup_triggered(session, participant_ids: list) -> None:
+    """Stamp evening_followup_triggered_at so the follow-up is not re-sent tonight.
+    Cleared by reset_notification_flags at the daily reset."""
+    session.query(Patient).filter(
+        Patient.more_participant_id.in_(participant_ids)
+    ).update(
+        {Patient.evening_followup_triggered_at: datetime.now(timezone.utc)},
+        synchronize_session=False,
+    )
+    session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Scheduled tasks
 # ---------------------------------------------------------------------------
@@ -192,7 +206,11 @@ def reset_notification_flags():
         updated_count = (
             session.query(Patient)
             .update(
-                {Patient.notif_in_24h: False, Patient.daily_survey_triggered_at: None}
+                {
+                    Patient.notif_in_24h: False,
+                    Patient.daily_survey_triggered_at: None,
+                    Patient.evening_followup_triggered_at: None,
+                }
             )
         )
         session.query(DailyCheckin).delete()
@@ -587,19 +605,21 @@ def trigger_evening_followup_task():
             .filter(Patient.notif_in_24h == True, Patient.more_participant_id != None)
             .all()
         ]
+
+        if not participant_ids:
+            logger.info("trigger_evening_followup_task: no notified participants today")
+            return {"status": "success", "triggered": 0}
+
+        result = _trigger_more_assessment(participant_ids, EVENING_FOLLOW_UP_TOKEN)
+        if result.get("status") == "success":
+            _mark_evening_followup_triggered(session, participant_ids)
+        logger.info(
+            "trigger_evening_followup_task: triggered %d participant(s)",
+            len(participant_ids),
+        )
+        return {"status": result.get("status"), "triggered": len(participant_ids)}
     finally:
         session.close()
-
-    if not participant_ids:
-        logger.info("trigger_evening_followup_task: no notified participants today")
-        return {"status": "success", "triggered": 0}
-
-    result = _trigger_more_assessment(participant_ids, EVENING_FOLLOW_UP_TOKEN)
-    logger.info(
-        "trigger_evening_followup_task: triggered %d participant(s)",
-        len(participant_ids),
-    )
-    return {"status": result.get("status"), "triggered": len(participant_ids)}
 
 
 @celery_app.task(name="app.tasks.fetch_evening_followup_task")
@@ -863,6 +883,77 @@ def update_schedule_fields_task():
     except Exception as e:
         session.rollback()
         logger.error("update_schedule_fields_task failed: %s", e)
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@celery_app.task(name="app.tasks.trigger_late_evening_followup_task")
+def trigger_late_evening_followup_task():
+    """
+    Runs every 20 min from 20:00, after the regular evening follow-up.
+    Participants whose notification window ends after LATE_FOLLOWUP_CUTOFF can be
+    notified *after* trigger_evening_followup_task has already run, so their survey
+    would ask about a nudge they had not received yet. This re-triggers the follow-up
+    for those participants — but only if a notification was actually generated for
+    them today past the cutoff, and only once per day (evening_followup_triggered_at,
+    cleared by reset_notification_flags).
+    """
+    from sqlalchemy import text
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            text(
+                """
+                WITH today AS (
+                    SELECT lower(to_char(now() AT TIME ZONE :tz, 'FMDay')) AS weekday,
+                           (now() AT TIME ZONE :tz)::date AS local_date
+                )
+                SELECT DISTINCT gn.more_participant_id
+                FROM generated_notifications gn
+                JOIN patients p ON p.more_participant_id = gn.more_participant_id
+                CROSS JOIN today t
+                WHERE p.evening_followup_triggered_at IS NULL
+                  AND jsonb_typeof(p.time_to_notif) = 'object'
+                  AND (p.time_to_notif -> t.weekday ->> 'end') IS NOT NULL
+                  AND (p.time_to_notif -> t.weekday ->> 'end')::time > CAST(:cutoff AS time)
+                  AND (gn.generated_at AT TIME ZONE :tz)::date = t.local_date
+                  AND (gn.generated_at AT TIME ZONE :tz)::time > CAST(:cutoff AS time)
+                  AND gn.more_participant_id IS NOT NULL
+                """
+            ),
+            {"tz": LOCAL_TZ_NAME, "cutoff": LATE_FOLLOWUP_CUTOFF},
+        ).all()
+        participant_ids = [r[0] for r in rows]
+
+        if not participant_ids:
+            logger.info(
+                "trigger_late_evening_followup_task: nobody pending past %s",
+                LATE_FOLLOWUP_CUTOFF,
+            )
+            return {"status": "success", "triggered": 0}
+
+        result = _trigger_more_assessment(participant_ids, EVENING_FOLLOW_UP_TOKEN)
+        if result.get("status") != "success":
+            # Leave the flag unset so the next tick retries.
+            logger.error(
+                "trigger_late_evening_followup_task: trigger failed for %s, will retry",
+                participant_ids,
+            )
+            return {"status": "error", "message": result.get("message")}
+
+        _mark_evening_followup_triggered(session, participant_ids)
+        logger.info(
+            "trigger_late_evening_followup_task: triggered %d participant(s) past %s: %s",
+            len(participant_ids),
+            LATE_FOLLOWUP_CUTOFF,
+            participant_ids,
+        )
+        return {"status": "success", "triggered": len(participant_ids)}
+    except Exception as e:
+        session.rollback()
+        logger.error("trigger_late_evening_followup_task failed: %s", e)
         return {"status": "error", "message": str(e)}
     finally:
         session.close()

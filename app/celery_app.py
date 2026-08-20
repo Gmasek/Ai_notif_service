@@ -42,6 +42,12 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.trigger_evening_followup_task",
         "schedule": crontab(hour=17, minute=30),
     },
+    # Every 20 min from 20:00: re-trigger evening follow-up for participants whose
+    # notification window ends after the 19:30 cutoff and who were notified after it
+    "trigger-late-evening-followup-nightly": {
+        "task": "app.tasks.trigger_late_evening_followup_task",
+        "schedule": crontab(hour="20-23", minute="0,20,40"),
+    },
     # Nightly: collect evening follow-up responses from LimeSurvey
     "fetch-evening-followup-nightly": {
         "task": "app.tasks.fetch_evening_followup_task",

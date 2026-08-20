@@ -40,6 +40,7 @@ class Patient(Base):
 
     notif_in_24h = Column(Boolean, default=False)
     daily_survey_triggered_at = Column(TIMESTAMP(timezone=True), nullable=True)
+    evening_followup_triggered_at = Column(TIMESTAMP(timezone=True), nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
