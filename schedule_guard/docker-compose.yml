@@ -1,0 +1,31 @@
+# Standalone deployment for the schedule guard.
+# It talks only to the shared Postgres (patients.time_to_notif) and keeps its
+# own JSON backup on a named volume — nothing else in the main stack changes.
+#
+#   docker compose up -d --build
+#
+# The container must be able to reach Postgres. By default it joins the main
+# app's Docker network (so it can resolve the `db` hostname). Set DB_NETWORK to
+# the actual network name — find it with:  docker network ls
+services:
+  schedule-guard:
+    build: .
+    image: schedule-guard:latest
+    container_name: schedule_guard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - schedule_guard_data:/data
+    networks:
+      - db_net
+
+volumes:
+  schedule_guard_data:
+
+networks:
+  db_net:
+    external: true
+    name: ${DB_NETWORK:-ai_notif_prototype_default}
